@@ -5,7 +5,6 @@ cfg_signal_internal_and_unix! {
 cfg_io_uring! {
     mod uring;
     use uring::UringContext;
-    pub(crate) use uring::RegisterResult;
     use crate::sync::OnceCell;
 }
 
@@ -231,21 +230,7 @@ impl Driver {
             target_os = "linux",
         ))]
         {
-            let mut guard = handle.get_uring().lock();
-            let ctx = &mut *guard;
-            ctx.dispatch_completions();
-
-            // There might be some cases where the CQ overflows, so we need to flush
-            // the remaining buffered CQEs.
-            while ctx
-                .uring
-                .as_mut()
-                .is_some_and(|uring| uring.submission().cq_overflow())
-            {
-                ctx.submit()
-                    .expect("failed to flush io_uring completion queue overflow");
-                ctx.dispatch_completions();
-            }
+            handle.dispatch_completions();
         }
 
         handle.metrics.incr_ready_count_by(ready_count);

@@ -5,7 +5,6 @@ use crate::io::uring::rename::Rename;
 use crate::io::uring::utils::ArcFd;
 use crate::io::uring::write::Write;
 
-use crate::runtime::io::RegisterResult;
 use crate::runtime::Handle;
 
 #[cfg(
@@ -57,9 +56,6 @@ pub(crate) enum CancelData {
 
 #[derive(Debug)]
 pub(crate) enum Lifecycle {
-    /// The operation has been submitted to uring and is currently in-flight
-    Submitted,
-
     /// The submitter is waiting for the completion of the operation
     Waiting(Waker),
 
@@ -181,12 +177,11 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                 // SAFETY: entry is valid for the entire duration of the operation
                 let result = unsafe { driver.register_op(entry, waker) };
 
-                match result {
-                    RegisterResult::Submitted(idx) => this.state = State::Polled(idx),
-
+                let index = match result {
+                    Ok(index) => index,
                     // The kernel never saw the entry, so the resources go back to
                     // the caller with the error.
-                    RegisterResult::NotPushed(err) => {
+                    Err(err) => {
                         let data = this
                             .take_data()
                             .expect("Data must be present on Initialization");
@@ -195,63 +190,56 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
                         return Poll::Ready(data.complete_with_error(err));
                     }
-
-                    // The kernel may have seen the entry, so cancel to keep the
-                    // resources alive until completion instead of returning them.
-                    RegisterResult::Pushed { index, error } => {
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on Initialization");
-
-                        this.handle.inner.driver().io().cancel_op(index, Some(data));
-
-                        this.state = State::Complete;
-
-                        return Poll::Ready(T::complete_after_cancel(error));
-                    }
                 };
-
+                // Submission can invoke wakers. Record thé slot first so that a
+                // callback panic leave Drop able to retain the operation data.
+                this.state = State::Polled(index);
+                if let Err(error) = this.handle.inner.driver().io().submit() {
+                    let data = this.take_data().expect("Data must be present after push");
+                    // Cancellation can drop the previous waker, which may panic.
+                    this.state = State::Complete;
+                    this.handle.inner.driver().io().cancel_op(index, Some(data));
+                    return Poll::Ready(T::complete_after_cancel(error));
+                }
                 Poll::Pending
             }
 
             State::Polled(idx) => {
                 let driver = this.handle.inner.driver().io();
-                let mut ctx = driver.get_uring().lock();
-                let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
-
-                match mem::replace(lifecycle, Lifecycle::Submitted) {
-                    // Only replace the stored waker if it wouldn't wake the new one
-                    Lifecycle::Waiting(prev) if !prev.will_wake(cx.waker()) => {
-                        let waker = cx.waker().clone();
-                        *lifecycle = Lifecycle::Waiting(waker);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Waiting(prev) => {
-                        *lifecycle = Lifecycle::Waiting(prev);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Completed(cqe) => {
-                        // Clean up and complete the future
-                        ctx.remove_op(*idx);
-
-                        this.state = State::Complete;
-
-                        drop(ctx);
-
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on completion");
-                        Poll::Ready(data.complete(cqe.into()))
-                    }
-
-                    Lifecycle::Submitted => {
-                        unreachable!("Submitted lifecycle should never be seen here");
-                    }
-
-                    Lifecycle::Cancelled(_) => {
-                        unreachable!("Cancelled lifecycle should never be seen here");
+                let mut waker = None;
+                loop {
+                    let mut ctx = driver.get_uring().lock();
+                    let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
+                    match lifecycle {
+                        Lifecycle::Waiting(prev) if prev.will_wake(cx.waker()) => {
+                            return Poll::Pending;
+                        }
+                        Lifecycle::Waiting(_) => {
+                            if let Some(waker) = waker.take() {
+                                let prev = mem::replace(lifecycle, Lifecycle::Waiting(waker));
+                                drop(ctx);
+                                drop(prev);
+                                return Poll::Pending;
+                            }
+                            // Cloning and dropping wakers may re-enter the driver or panic.
+                            // Recheck the lifecycle after cloning outside the ock.
+                            drop(ctx);
+                            waker = Some(cx.waker().clone());
+                        }
+                        Lifecycle::Completed(_) => {
+                            let Lifecycle::Completed(cqe) = ctx.remove_op(*idx) else {
+                                unreachable!();
+                            };
+                            this.state = State::Complete;
+                            drop(ctx);
+                            let data = this
+                                .take_data()
+                                .expect("Data must be present on completion");
+                            return Poll::Ready(data.complete(cqe.into()));
+                        }
+                        Lifecycle::Cancelled(_) => {
+                            unreachable!("Cancelled lifecycle should never be seen here");
+                        }
                     }
                 }
             }

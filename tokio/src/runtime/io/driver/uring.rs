@@ -5,6 +5,7 @@ use slab::Slab;
 use crate::runtime::driver::op::CancelData;
 use crate::runtime::driver::op::CqeResult;
 use crate::runtime::driver::op::{Cancellable, Lifecycle};
+use crate::util::WakeList;
 use crate::{io::Interest, loom::sync::Mutex};
 
 use super::{Handle, TOKEN_WAKEUP};
@@ -13,19 +14,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{io, mem, task::Waker};
 
 const DEFAULT_RING_SIZE: u32 = 256;
-
-/// Outcome of registering an op with the io_uring.
-pub(crate) enum RegisterResult {
-    /// In-flight at this slab index.
-    Submitted(usize),
-
-    /// Submit failed before reaching the kernel; the slot was removed.
-    NotPushed(io::Error),
-
-    /// Submit failed after reaching the kernel; the slot is kept and the caller
-    /// must cancel it to keep its resources alive until completion.
-    Pushed { index: usize, error: io::Error },
-}
 
 pub(crate) struct UringContext {
     pub(crate) uring: Option<io_uring::IoUring>,
@@ -75,16 +63,18 @@ impl UringContext {
         Ok(true)
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
+    fn dispatch_completions(&mut self, wakers: &mut WakeList) {
         let ops = &mut self.ops;
         let Some(uring) = self.uring.as_mut() else {
             // Uring is not initialized yet.
             return;
         };
 
-        let cq = uring.completion();
-
-        for cqe in cq {
+        let mut cq = uring.completion();
+        while wakers.can_push() {
+            let Some(cqe) = cq.next() else {
+                break;
+            };
             let idx = cqe.user_data() as usize;
 
             match ops.get_mut(idx) {
@@ -94,7 +84,7 @@ impl UringContext {
                     else {
                         unreachable!()
                     };
-                    waker.wake_by_ref();
+                    wakers.push(waker);
                 }
                 Some(Lifecycle::Cancelled(cancel_data)) => {
                     if let CancelData::Open(_) = cancel_data {
@@ -120,19 +110,28 @@ impl UringContext {
         // `cq`'s drop gets called here, updating the latest head pointer
     }
 
-    pub(crate) fn submit(&mut self) -> io::Result<()> {
+    // Returns false when the caller must release the lock, wake the batch and retry.
+    // A true result mean the submission queue was drained, not the completion queue.
+    fn submit(&mut self, wakers: &mut WakeList) -> io::Result<bool> {
         loop {
+            if self.ring_mut().completion().is_full() {
+                self.dispatch_completions(wakers);
+                if !wakers.can_push() {
+                    return Ok(false);
+                }
+            }
             // Errors from io_uring_enter: https://man7.org/linux/man-pages/man2/io_uring_enter.2.html#ERRORS
             match self.ring().submit() {
                 Ok(_) => {
                     if self.ring_mut().submission().is_empty() {
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
 
                 // If the submission queue is full, we dispatch completions and try again.
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions();
+                    self.dispatch_completions(wakers);
+                    return Ok(false);
                 }
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 // For other errors, we currently return the error as is.
@@ -157,8 +156,11 @@ impl Drop for UringContext {
         }
 
         // Make sure we flush the submission queue before dropping the driver.
-        if !self.ring_mut().submission().is_empty() {
-            self.submit().expect("Internal error when dropping driver");
+        while !self.ring_mut().submission().is_empty() {
+            let mut wakers = WakeList::new();
+            self.submit(&mut wakers)
+                .expect("Internal error when dropping driver");
+            wakers.wake_all();
         }
 
         let mut ops = std::mem::take(&mut self.ops);
@@ -267,59 +269,66 @@ impl Handle {
         Ok(())
     }
 
-    /// Register an operation with the io_uring.
-    ///
-    /// If this is the first io_uring operation, it will also initialize the io_uring context.
-    /// If io_uring isn't supported, this function returns an `ENOSYS` error, so the caller can
-    /// perform custom handling, such as falling back to an alternative mechanism.
+    /// Push an operation onto the initialized ring and return its slab index.
+    /// A submission error while making room leaves this entry unpushed.
     ///
     /// # Safety
     ///
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
-    pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> RegisterResult {
+    /// Record the returned index before submitting or invoking any user callbacks so that
+    /// unwinding can cancel the operation without freeing its resources permaturely.
+    pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> io::Result<usize> {
         assert!(self.uring_probe.initialized());
-
-        // Uring is initialized.
-
         let mut guard = self.get_uring().lock();
+        while guard.ring_mut().submission().is_full() {
+            drop(guard);
+            self.submit()?;
+            guard = self.get_uring().lock();
+        }
         let ctx = &mut *guard;
         let index = ctx.ops.insert(Lifecycle::Waiting(waker));
         let entry = entry.user_data(index as u64);
-
-        // `entry` has not been pushed yet, so a submit error here means it never
-        // reached the kernel and we can drop the slot before returning.
-        let submit_before_push = |ctx: &mut UringContext| -> io::Result<()> {
-            if let Err(e) = ctx.submit() {
-                ctx.remove_op(index);
-                return Err(e);
-            }
-            Ok(())
-        };
-
         // SAFETY: entry is valid for the entire duration of the operation
-        while unsafe { ctx.ring_mut().submission().push(&entry).is_err() } {
-            // If the submission queue is full, flush it to the kernel and retry.
-            if let Err(e) = submit_before_push(ctx) {
-                return RegisterResult::NotPushed(e);
+        unsafe { ctx.ring_mut().submission().push(&entry) }
+            .expect("submission queue has space while locked");
+        // No callbacks may run between publishing the SQE and returning its index.
+        Ok(index)
+    }
+
+    pub(crate) fn submit(&self) -> io::Result<()> {
+        let mut wakers = WakeList::new();
+        loop {
+            let result = self.get_uring().lock().submit(&mut wakers);
+            wakers.wake_all();
+            if result? {
+                return Ok(());
             }
         }
+    }
 
-        // Ensure that the completion queue is not full before submitting the entry.
-        while ctx.ring_mut().completion().is_full() {
-            ctx.dispatch_completions();
+    pub(crate) fn dispatch_completions(&self) {
+        let mut wakers = WakeList::new();
+        loop {
+            let mut ctx = self.get_uring().lock();
+            ctx.dispatch_completions(&mut wakers);
+            let done = if let Some(uring) = ctx.uring.as_mut() {
+                if uring.submission().cq_overflow() {
+                    ctx.submit(&mut wakers)
+                        .expect("failed to flush io_uring completion queue overflow");
+                    false
+                } else {
+                    uring.completion().is_empty()
+                }
+            } else {
+                true
+            };
+            drop(ctx);
+            wakers.wake_all();
+            if done {
+                return;
+            }
         }
-
-        // Note: For now, we submit the entry immediately without utilizing batching.
-        //
-        // `entry` is now pushed, so the kernel may already own the buffer it
-        // points at. Keep the slot on a submit error: dropping it would let the
-        // `Op` free the buffer while it is still in use.
-        if let Err(e) = ctx.submit() {
-            return RegisterResult::Pushed { index, error: e };
-        }
-
-        RegisterResult::Submitted(index)
     }
 
     pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
@@ -335,12 +344,13 @@ impl Handle {
         // uring data alive until the operation completes.
 
         let cancel_data = data.expect("Data should be present").cancel();
-        match mem::replace(lifecycle, Lifecycle::Cancelled(cancel_data)) {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => (),
+        let prev = mem::replace(lifecycle, Lifecycle::Cancelled(cancel_data));
+        match &prev {
+            Lifecycle::Waiting(_) => (),
             // The driver saw the completion, but it was never polled.
             Lifecycle::Completed(cqe) => {
                 if let Lifecycle::Cancelled(CancelData::Open(_)) = lifecycle {
-                    if let Ok(fd) = CqeResult::from(cqe).result {
+                    if let Ok(fd) = CqeResult::from(cqe.clone()).result {
                         // SAFETY: the successful CQE result provides
                         // a non-negative integer, and the event is
                         // related to an open operation.
@@ -352,6 +362,8 @@ impl Handle {
             }
             prev => panic!("Unexpected state: {prev:?}"),
         };
+        drop(guard);
+        drop(prev);
     }
 }
 
