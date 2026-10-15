@@ -308,5 +308,5 @@ cfg_io_blocking! {
 }
 
 cfg_io_uring! {
-    pub(crate) mod uring;
+    pub mod uring;
 }
