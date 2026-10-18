@@ -1,36 +1,19 @@
-use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult, Op};
+use crate::runtime::driver::op::{Completable, Op};
 use crate::util::as_ref::OwnedBuf;
 
 use io_uring::{opcode, types};
-use std::io::{self, Error};
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-#[derive(Debug)]
 pub(crate) struct Write {
     buf: OwnedBuf,
     fd: OwnedFd,
 }
 
 impl Completable for Write {
-    // The buffer and fd are `None` only when the op was cancelled and they were
-    // kept in the driver; otherwise they are returned to the caller.
-    type Output = (io::Result<u32>, Option<OwnedBuf>, Option<OwnedFd>);
-    fn complete(self, cqe: CqeResult) -> Self::Output {
-        (cqe.result, Some(self.buf), Some(self.fd))
-    }
-
-    fn complete_with_error(self, err: Error) -> Self::Output {
-        (Err(err), Some(self.buf), Some(self.fd))
-    }
-
-    fn complete_after_cancel(err: Error) -> Self::Output {
-        (Err(err), None, None)
-    }
-}
-
-impl Cancellable for Write {
-    fn cancel(self) -> CancelData {
-        CancelData::Write(self)
+    type Output = (io::Result<u32>, OwnedFd, OwnedBuf);
+    fn complete(self, result: io::Result<u32>) -> Self::Output {
+        (result, self.fd, self.buf)
     }
 }
 
@@ -42,7 +25,7 @@ impl Op<Write> {
         buf: OwnedBuf,
         buf_offset: usize,
         file_offset: u64,
-    ) -> io::Result<Self> {
+    ) -> Self {
         // There is a cap on how many bytes we can write in a single uring write operation.
         // ref: https://github.com/axboe/liburing/discussions/497
         let len = u32::try_from(buf.as_ref().len() - buf_offset).unwrap_or(u32::MAX);
@@ -53,9 +36,8 @@ impl Op<Write> {
             .offset(file_offset)
             .build();
 
-        // SAFETY: parameters of the entry, such as `fd` and `buf`, are valid
-        // until this operation completes.
-        let op = unsafe { Op::new(sqe, Write { buf, fd }) };
-        Ok(op)
+        // SAFETY: Write keeps the fd and buffer alive until the CQE. OwnedBuf's
+        // Vec and Bytes keep their bytes at a fixed address across moves.
+        unsafe { Op::new(sqe, Write { buf, fd }) }
     }
 }

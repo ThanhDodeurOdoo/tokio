@@ -1,13 +1,12 @@
 use super::utils::cstr;
 
-use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult, Op};
+use crate::runtime::driver::op::{Completable, Op};
 
 use io_uring::{opcode, types};
 use std::ffi::CString;
 use std::io;
 use std::path::Path;
 
-#[derive(Debug)]
 pub(crate) struct Rename {
     /// This field will be read by the kernel during the operation, so we
     /// need to ensure it is valid for the entire duration of the operation.
@@ -18,22 +17,8 @@ pub(crate) struct Rename {
 impl Completable for Rename {
     type Output = io::Result<()>;
 
-    fn complete(self, cqe: CqeResult) -> Self::Output {
-        cqe.result.map(drop)
-    }
-
-    fn complete_with_error(self, error: io::Error) -> Self::Output {
-        Err(error)
-    }
-
-    fn complete_after_cancel(error: io::Error) -> Self::Output {
-        Err(error)
-    }
-}
-
-impl Cancellable for Rename {
-    fn cancel(self) -> CancelData {
-        CancelData::Rename(self)
+    fn complete(self, result: io::Result<u32>) -> Self::Output {
+        result.map(drop)
     }
 }
 

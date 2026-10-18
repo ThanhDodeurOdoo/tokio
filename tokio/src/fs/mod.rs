@@ -310,6 +310,8 @@ cfg_io_uring! {
     pub(crate) mod read_uring;
     pub(crate) use self::read_uring::read_uring;
 
+    #[cfg(any(target_env = "gnu", target_os = "android"))]
+    pub(crate) use self::file::ArcFd;
     pub(crate) use self::open_options::UringOpenOptions;
 }
 

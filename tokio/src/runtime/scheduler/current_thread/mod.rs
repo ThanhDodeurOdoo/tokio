@@ -377,6 +377,12 @@ fn wake_deferred_tasks_and_free(context: &Context) {
 // ===== impl Context =====
 
 impl Context {
+    cfg_io_uring! {
+        pub(crate) fn unhandled_io_panic(&self) {
+            self.handle.unhandled_panic();
+        }
+    }
+
     /// Execute the closure with the given scheduler core stored in the
     /// thread-local context.
     fn run_task(&self, task: LocalNotified<Arc<Handle>>, mut core: Box<Core>) -> Box<Core> {
@@ -762,13 +768,21 @@ impl Schedule for Arc<Handle> {
                     // called.
                     context::with_scheduler(|maybe_cx| match maybe_cx {
                         Some(CurrentThread(cx)) if Arc::ptr_eq(self, &cx.handle) => {
-                            let mut core = cx.core.borrow_mut();
-
-                            // If `None`, the runtime is shutting down, so there is no need to signal shutdown
-                            if let Some(core) = core.as_mut() {
-                                core.unhandled_panic = true;
-                                self.shared.owned.close_and_shutdown_all(0);
+                            {
+                                let mut core = cx.core.borrow_mut();
+                                // None means we're already shutting down. Only the
+                                // first report needs to cancel the tasks.
+                                match core.as_mut() {
+                                    Some(core) if !core.unhandled_panic => {
+                                        core.unhandled_panic = true;
+                                    }
+                                    _ => return,
+                                }
                             }
+                            // Shutting down tasks runs destructors and wakers that can
+                            // re-enter here or report another panic They'd panic just
+                            // from borrowing the core again.
+                            self.shared.owned.close_and_shutdown_all(0);
                         }
                         _ => unreachable!("runtime core not set in CURRENT thread-local"),
                     })
@@ -823,6 +837,12 @@ impl CoreGuard<'_> {
             core.metrics.start_processing_scheduled_tasks();
 
             'outer: loop {
+                // With ShutdownRuntime, observe task and callback panics before polling
+                // the main future, even if a callback woke it before panicking or a later
+                // block_on call would immediately return Ready.
+                if core.unhandled_panic {
+                    return (core, None);
+                }
                 let handle = &context.handle;
 
                 if handle.reset_woken() {
@@ -886,7 +906,7 @@ impl CoreGuard<'_> {
             Some(ret) => ret,
             None => {
                 // `block_on` panicked.
-                panic!("a spawned task panicked and the runtime is configured to shut down on unhandled panic");
+                panic!("the runtime is configured to shut down on unhandled panic");
             }
         }
     }

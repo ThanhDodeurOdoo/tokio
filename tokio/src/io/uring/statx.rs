@@ -15,12 +15,12 @@
     any(target_env = "gnu", target_os = "android")
 ))]
 
-use crate::fs::File;
+use crate::fs::{ArcFd, File};
 use crate::io::uring::utils::cstr;
-use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult, Op};
+use crate::runtime::driver::op::{Completable, Op};
 use io_uring::{opcode, types};
 use libc::statx;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::mem::MaybeUninit;
@@ -44,39 +44,23 @@ impl Debug for Metadata {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct Statx {
-    /// This field will be read by the kernel during the operation, so we
-    /// need to ensure it is valid for the entire duration of the operation.
-    _path: CString,
-    buffer: Box<MaybeUninit<statx>>,
+    // The SQE points into this path (fd queries pass a static empty path instead).
+    _path: Option<CString>,
+    // prevent the fd from being closed/reused if the metadata future is dropped
+    _fd: Option<ArcFd>,
+    // maybe a bit weird but vec avoids Box's aliasing restrictions when
+    // statx moves after we take the kernel's pointer.
+    buffer: Vec<MaybeUninit<statx>>,
 }
 
 impl Completable for Statx {
     type Output = io::Result<Metadata>;
 
-    fn complete(self, cqe: CqeResult) -> Self::Output {
-        // SAFETY: On success, we always receive 0, which should guarantee
-        // that the information about a file is stored inside the
-        // statx buffer. On failure, we'll receive an Error value.
-        // Refer to man page description and return value:
+    fn complete(self, result: io::Result<u32>) -> Self::Output {
+        // SAFETY: On success, statx has filled in the output buffer.
         // https://man7.org/linux/man-pages/man2/statx.2.html
-        cqe.result
-            .map(|_| Metadata(unsafe { *self.buffer.as_ptr() }))
-    }
-
-    fn complete_with_error(self, error: io::Error) -> Self::Output {
-        Err(error)
-    }
-
-    fn complete_after_cancel(error: io::Error) -> Self::Output {
-        Err(error)
-    }
-}
-
-impl Cancellable for Statx {
-    fn cancel(self) -> CancelData {
-        CancelData::Statx(self)
+        result.map(|_| Metadata(unsafe { self.buffer[0].assume_init_read() }))
     }
 }
 
@@ -85,7 +69,7 @@ impl Op<Statx> {
     #[inline]
     fn statx(path: &Path, flags: i32) -> io::Result<Op<Statx>> {
         let path = cstr(path)?;
-        let mut buffer = Box::new(MaybeUninit::<statx>::uninit());
+        let mut buffer = vec![MaybeUninit::<statx>::uninit()];
 
         let statx_op = opcode::Statx::new(
             types::Fd(libc::AT_FDCWD),
@@ -96,12 +80,13 @@ impl Op<Statx> {
         .mask(libc::STATX_BASIC_STATS | libc::STATX_BTIME)
         .build();
 
-        // SAFETY: Parameters are valid for the entire duration of the operation
+        // SAFETY: Statx keeps the path and output buffer alive until the operation completes.
         Ok(unsafe {
             Op::new(
                 statx_op,
                 Statx {
-                    _path: path,
+                    _path: Some(path),
+                    _fd: None,
                     buffer,
                 },
             )
@@ -116,36 +101,34 @@ impl Op<Statx> {
     }
 
     /// Retrieves the metadata information of the given file
-    pub(crate) fn file_metadata(file: &File) -> io::Result<Op<Statx>> {
-        let mut buffer = Box::new(MaybeUninit::<statx>::uninit());
-        let empty_path: &'static CStr = c"";
+    pub(crate) fn file_metadata(file: &File) -> Self {
+        let fd = file.uring_fd();
+        let mut buffer = vec![MaybeUninit::<statx>::uninit()];
 
         // io-uring was introduced in linux 5.1
         // pass in an empty path instead of null to target the file descriptor
         // status as specified by man:
         // https://man7.org/linux/man-pages/man2/statx.2.html
         let statx_op = opcode::Statx::new(
-            types::Fd(file.as_raw_fd()),
-            // it should be fine to pass in `empty_path` whose lifetime
-            // does not exceed the `file_metadata()` function as a ptr here
-            // because we want to stat the dirfd not this pathname
-            empty_path.as_ptr(),
+            types::Fd(fd.as_raw_fd()),
+            c"".as_ptr(),
             buffer.as_mut_ptr().cast(),
         )
         .flags(libc::AT_STATX_SYNC_AS_STAT | libc::AT_EMPTY_PATH)
         .mask(libc::STATX_BASIC_STATS | libc::STATX_BTIME)
         .build();
 
-        // SAFETY: Parameters are valid for the entire duration of the operation
-        Ok(unsafe {
+        // SAFETY: Statx keeps the fd and output buffer alive until the operation completes.
+        unsafe {
             Op::new(
                 statx_op,
                 Statx {
-                    _path: empty_path.into(),
+                    _path: None,
+                    _fd: Some(fd),
                     buffer,
                 },
             )
-        })
+        }
     }
 
     // TODO: Once `Metadata::from_statx` is stabilized, we can use use this function

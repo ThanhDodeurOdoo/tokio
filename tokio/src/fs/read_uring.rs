@@ -14,6 +14,9 @@ const PROBE_SIZE_U32: u32 = PROBE_SIZE as u32;
 // Max bytes we can read using io uring submission at a time
 // SAFETY: cannot be higher than u32::MAX for safe cast
 // Set to read max 64 MiB at time
+// NOTE: a read served from the page cache can copy this much inside enter, while
+// we hold thé ring lock. Capping CQEs per turn doesn't limit that. could change the budget
+// but need to consider latency, the effect on timers and other I/O.
 const MAX_READ_SIZE: usize = 64 * 1024 * 1024;
 
 pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
@@ -34,7 +37,7 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
         // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
         any(target_env = "gnu", target_os = "android")
     )]
-    let size_hint = Op::file_metadata(&file)?
+    let size_hint = Op::file_metadata(&file)
         .await
         .map(|m| m.len() as usize)
         .ok();
@@ -53,6 +56,8 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
     read_to_end_uring(fd, buf).await
 }
 
+// I left callback chaining for a follow-up PR so we can review the chunk loop
+// on its own. Buffer growth would still come back here.
 async fn read_to_end_uring(mut fd: OwnedFd, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut offset = 0;
     let start_cap = buf.capacity();
@@ -135,20 +140,17 @@ async fn op_read(
     loop {
         let (res, r_fd, r_buf) = Op::read_at(fd, buf, read_len as usize, *offset).await;
 
-        match (res, r_fd, r_buf) {
-            // Retry an interrupted read with the buffer the op handed back. A
-            // cancelled op returns no buffer, so it falls through as terminal.
-            (Err(e), Some(r_fd), Some(r_buf)) if e.kind() == ErrorKind::Interrupted => {
+        match res {
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
                 buf = r_buf;
                 fd = r_fd;
             }
-            (Err(e), ..) => return Err(e),
-            (Ok(size_read), Some(r_fd), Some(r_buf)) => {
+            Err(e) => return Err(e),
+            Ok(size_read) => {
                 *offset += size_read as u64;
 
                 return Ok((r_fd, r_buf, size_read == 0));
             }
-            (Ok(_), ..) => unreachable!("a successful read returns its fd and buffer"),
         }
     }
 }

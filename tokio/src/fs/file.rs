@@ -33,6 +33,8 @@ use std::fs::File as StdFile;
 cfg_io_uring! {
     #[cfg(not(test))]
     use crate::spawn;
+    #[cfg(any(not(test), target_env = "gnu", target_os = "android"))]
+    pub(crate) type ArcFd = Arc<StdFile>;
 }
 
 /// A reference to an open file on the filesystem.
@@ -435,6 +437,13 @@ impl File {
                 inner.pos = pos;
             }),
             _ => unreachable!(),
+        }
+    }
+
+    cfg_io_uring! {
+        #[cfg(any(target_env = "gnu", target_os = "android"))]
+        pub(crate) fn uring_fd(&self) -> ArcFd {
+            self.std.clone()
         }
     }
 
@@ -1078,8 +1087,7 @@ impl Inner {
                 if let Some(driver_handle) = handle.inner.driver().io.as_ref() {
                     if driver_handle.is_uring_ready(io_uring::opcode::Read::CODE) {
                         // Fast path: uring already initialized and Read supported.
-                        let fd: crate::io::uring::utils::ArcFd = std;
-                        return Ok(spawn(Self::uring_read(fd, buf, max_buf_size)));
+                        return Ok(spawn(Self::uring_read(std, buf, max_buf_size)));
                     }
 
                     if !driver_handle.is_uring_probed() {
@@ -1088,7 +1096,7 @@ impl Inner {
                         return Ok(spawn(Self::lazy_init_read(std, buf, max_buf_size)));
                     }
                 }
-                // No IO driver or probed but unsupported: fall through to spawn_blocking.
+                // No IO driver, unsupported opcode or failed ring: fall through to spawn_blocking.
             }
         }
 
@@ -1106,32 +1114,19 @@ impl Inner {
         feature = "fs",
         target_os = "linux",
     ))]
-    async fn uring_read(
-        mut fd: crate::io::uring::utils::ArcFd,
-        mut buf: Buf,
-        max_buf_size: usize,
-    ) -> (Operation, Buf) {
+    async fn uring_read(mut fd: ArcFd, mut buf: Buf, max_buf_size: usize) -> (Operation, Buf) {
         use crate::runtime::driver::op::Op;
 
         loop {
             let (res, r_fd, r_buf) =
                 // u64::MAX to use and advance the file position
                 Op::read_at(fd, buf, max_buf_size, u64::MAX).await;
-            match (res, r_fd, r_buf) {
-                // Retry an interrupted read with the resources the op handed back.
-                (Err(e), Some(r_fd), Some(r_buf)) if e.kind() == io::ErrorKind::Interrupted => {
+            match res {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                     buf = r_buf;
                     fd = r_fd;
-                    continue;
                 }
-                // A cancelled op keeps its buffer in the driver, so the idle slot
-                // gets a fresh empty `Buf` instead.
-                (Err(e), _, r_buf) => {
-                    let buf = r_buf.unwrap_or_else(|| Buf::with_capacity(0));
-                    break (Operation::Read(Err(e)), buf);
-                }
-                (Ok(n), _, Some(r_buf)) => break (Operation::Read(Ok(n as usize)), r_buf),
-                (Ok(_), ..) => unreachable!("a successful read returns its buffer"),
+                result => break (Operation::Read(result.map(|n| n as usize)), r_buf),
             }
         }
     }
@@ -1147,7 +1142,7 @@ impl Inner {
         feature = "fs",
         target_os = "linux",
     ))]
-    async fn lazy_init_read(std: Arc<StdFile>, buf: Buf, max_buf_size: usize) -> (Operation, Buf) {
+    async fn lazy_init_read(std: ArcFd, buf: Buf, max_buf_size: usize) -> (Operation, Buf) {
         if let Ok(handle) = crate::runtime::Handle::try_current() {
             if let Some(driver_handle) = handle.inner.driver().io.as_ref() {
                 if driver_handle
@@ -1155,8 +1150,7 @@ impl Inner {
                     .await
                     .unwrap_or_default()
                 {
-                    let fd: crate::io::uring::utils::ArcFd = std;
-                    return Self::uring_read(fd, buf, max_buf_size).await;
+                    return Self::uring_read(std, buf, max_buf_size).await;
                 }
             }
         }
