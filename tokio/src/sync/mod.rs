@@ -504,6 +504,19 @@ cfg_not_sync! {
         pub(crate) use mutex::Mutex;
     }
 
+    cfg_io_uring! {
+        // ring init needs OnceCell and its Semaphore without `sync`
+        // Their full public APIs still compile here but partly unused
+        // and not exported in this config
+        #[allow(unreachable_pub, dead_code)]
+        mod once_cell;
+        pub(crate) use once_cell::OnceCell;
+        #[allow(unreachable_pub, dead_code)]
+        mod semaphore;
+        pub(crate) use semaphore::{Semaphore, SemaphorePermit};
+        pub(crate) use batch_semaphore::{AcquireError, TryAcquireError};
+    }
+
     #[cfg(any(feature = "rt", feature = "signal", all(unix, feature = "process")))]
     pub(crate) mod notify;
 

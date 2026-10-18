@@ -466,6 +466,17 @@ fn maybe_move_runtime() -> Result<(bool, bool), &'static str> {
 
         let cx = maybe_cx.expect("no .is_some() == false cases above should lead here");
 
+        // Without the parker, the assertion below would panic and drop the core,
+        // reject block_in_place here?
+        if cx
+            .core
+            .borrow()
+            .as_ref()
+            .is_some_and(|core| core.park.is_none())
+        {
+            return Err("block_in_place cannot be called while the worker is parked");
+        }
+
         // Since deferred tasks don't stay on `core`, make sure to wake them
         // before blocking.
         cx.defer.wake();

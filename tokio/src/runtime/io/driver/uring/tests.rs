@@ -1,6 +1,6 @@
 use super::super::{Driver, Handle};
-use super::RegisterResult;
-use crate::runtime::driver::op::Lifecycle;
+use super::INDEX_MASK;
+use crate::io::uring::Uring;
 
 use io_uring::{opcode, Probe};
 use std::os::fd::AsRawFd;
@@ -11,13 +11,8 @@ fn ready_handle() -> Option<(Driver, Handle)> {
     let (driver, handle) = Driver::new(1024, None).ok()?;
 
     let mut probe = Probe::new();
-    {
-        let mut guard = handle.get_uring().lock();
-        if !guard.try_init(&mut probe).ok()? {
-            return None;
-        }
-    }
-    handle.uring_probe.set(Some(probe)).unwrap();
+    handle.try_init(&mut probe).ok()?;
+    handle.uring.probe.set(Some(probe)).unwrap();
 
     Some((driver, handle))
 }
@@ -31,7 +26,7 @@ struct BrokenRing {
 
 impl BrokenRing {
     fn new(handle: &Handle) -> Self {
-        let ring_fd = handle.get_uring().lock().ring().as_raw_fd();
+        let ring_fd = handle.uring.context.lock().ring().as_raw_fd();
         let null = std::fs::File::open("/dev/null").unwrap();
         // SAFETY: `dup` and `dup2` are valid for any open file descriptor.
         let saved = unsafe { libc::dup(ring_fd) };
@@ -52,31 +47,46 @@ impl Drop for BrokenRing {
     }
 }
 
-// Once an entry is pushed onto the submission queue the kernel may already own
-// the buffer it points at, so a failing submission must keep the slot instead of
-// dropping the op and freeing the buffer while it is still in use.
+// A enter error can't retire an operation that was already accepted, the newest
+// SQE can only be rejected when the refreshed SQ head shows it wasn't consumed.
+//
+// can it stay a private fault test for now? We need enter itself to fail after
+// publication, not a file error coming back in a CQE. if it it a integration
+// test would need a way to trigger that failur without exposing the ring just
+// for the test.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn register_op_keeps_entry_on_submit_failure() {
+fn publish_failure_preserves_accepted_entry() {
+    unsafe fn complete(_: &Uring, _: io_uring::cqueue::Entry, _: *mut ()) {}
     let Some((_driver, handle)) = ready_handle() else {
         return;
     };
-
+    let ring = Uring::from_io(&handle);
+    // SAFETY: NOP doesn't point at any memory and the callback ignores its state.
+    let accepted =
+        unsafe { ring.submit(opcode::Nop::new().build(), complete, std::ptr::null_mut()) }.unwrap();
+    handle
+        .uring
+        .context
+        .lock()
+        .ring()
+        .submit_and_wait(1)
+        .unwrap();
     let broken = BrokenRing::new(&handle);
-
-    let entry = opcode::Nop::new().build();
-    // SAFETY: the no-op entry does not reference any buffer.
-    let res = unsafe { handle.register_op(entry, futures::task::noop_waker()) };
-
-    // The entry was pushed before the submit failed, so the slot is kept and its
-    // index handed back for the caller to cancel.
-    let RegisterResult::Pushed { index, .. } = res else {
-        panic!("expected Pushed after a post-push submit failure");
-    };
-    assert!(matches!(
-        handle.get_uring().lock().ops.get(index),
-        Some(Lifecycle::Waiting(_))
-    ));
-
+    // SAFETY: same as above, this NOP and its callback don't reference anything.
+    let rejected =
+        unsafe { ring.submit(opcode::Nop::new().build(), complete, std::ptr::null_mut()) };
+    assert!(rejected.is_err());
+    {
+        let ctx = handle.uring.context.lock();
+        assert_eq!(ctx.ops.len(), 1);
+        assert!(ctx
+            .ops
+            .contains((accepted.user_data() & INDEX_MASK) as usize));
+    }
     drop(broken);
+    handle.dispatch_completions();
+    let mut ctx = handle.uring.context.lock();
+    assert!(ctx.ops.is_empty());
+    assert_eq!(ctx.ring_mut().submission().len(), 1);
 }

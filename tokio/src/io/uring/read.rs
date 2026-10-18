@@ -1,14 +1,19 @@
 use crate::io::blocking::Buf;
-use crate::io::uring::utils::{ArcFd, UringFd};
-use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult, Op};
+use crate::runtime::driver::op::{Completable, Op};
 
 use io_uring::{opcode, types};
-use std::fmt;
-use std::io::{self, Error};
-use std::os::fd::OwnedFd;
+use std::io;
+use std::os::fd::AsRawFd;
 
 /// Trait for buffers that can be used with io-uring read operations.
-pub(crate) trait ReadBuffer: Send + 'static {
+///
+/// # Safety
+///
+/// After `uring_read_prepare`, the returned region must remain valid for
+/// exclusive kernel writes of the returned length while the buffer is kept
+/// alive and has not been borrowed mutably since that call, even when moved
+/// between threads.
+pub(crate) unsafe trait ReadBuffer: Send + 'static {
     /// Prepare the buffer for a read operation.
     /// Returns a pointer and length for the io-uring SQE.
     fn uring_read_prepare(&mut self, max_len: usize) -> (*mut u8, u32);
@@ -22,7 +27,8 @@ pub(crate) trait ReadBuffer: Send + 'static {
     unsafe fn uring_read_complete(&mut self, n: u32);
 }
 
-impl ReadBuffer for Vec<u8> {
+// SAFETY: the spare capacity belongs to this Vec and moving it preserves the allocation.
+unsafe impl ReadBuffer for Vec<u8> {
     fn uring_read_prepare(&mut self, max_len: usize) -> (*mut u8, u32) {
         let len = u32::try_from(max_len).unwrap_or(u32::MAX);
         assert!(self.spare_capacity_mut().len() >= len as usize);
@@ -37,7 +43,8 @@ impl ReadBuffer for Vec<u8> {
     }
 }
 
-impl ReadBuffer for Buf {
+// SAFETY: Buf prepares its private Vec's spare capacity, which is unaffected by moves.
+unsafe impl ReadBuffer for Buf {
     fn uring_read_prepare(&mut self, max_len: usize) -> (*mut u8, u32) {
         self.prepare_uring_read(max_len)
     }
@@ -48,60 +55,26 @@ impl ReadBuffer for Buf {
     }
 }
 
-pub(crate) struct Read<B, F = ArcFd> {
+pub(crate) struct Read<B, F> {
     fd: F,
     buf: B,
 }
 
-impl<B: fmt::Debug, F> fmt::Debug for Read<B, F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Read")
-            .field("buf", &self.buf)
-            .finish_non_exhaustive()
-    }
-}
+impl<B: ReadBuffer, F: Send + 'static> Completable for Read<B, F> {
+    type Output = (io::Result<u32>, F, B);
 
-impl<B: ReadBuffer, F: UringFd> Completable for Read<B, F> {
-    // The fd and buffer are `None` only when the op was cancelled and they were
-    // kept in the driver; otherwise they are returned to the caller.
-    type Output = (io::Result<u32>, Option<F>, Option<B>);
-
-    fn complete(self, cqe: CqeResult) -> Self::Output {
+    fn complete(self, result: io::Result<u32>) -> Self::Output {
         let mut buf = self.buf;
-        if let Ok(len) = cqe.result {
-            // SAFETY: kernel wrote exactly `len` bytes into the prepared buffer.
+        if let Ok(len) = result {
+            // SAFETY: once the CQE arrives the kernel is done with the buffer.
+            // `len` is how many bytes it actually wrote.
             unsafe { buf.uring_read_complete(len) };
         }
-        (cqe.result, Some(self.fd), Some(buf))
-    }
-
-    fn complete_with_error(self, err: Error) -> Self::Output {
-        (Err(err), Some(self.fd), Some(self.buf))
-    }
-
-    fn complete_after_cancel(err: Error) -> Self::Output {
-        (Err(err), None, None)
+        (result, self.fd, buf)
     }
 }
 
-impl Cancellable for Read<Vec<u8>, OwnedFd> {
-    fn cancel(self) -> CancelData {
-        CancelData::ReadVec(self)
-    }
-}
-
-impl Cancellable for Read<Buf, ArcFd> {
-    fn cancel(self) -> CancelData {
-        CancelData::ReadBuf(self)
-    }
-}
-
-impl<B, F> Op<Read<B, F>>
-where
-    B: ReadBuffer + fmt::Debug,
-    F: UringFd,
-    Read<B, F>: Cancellable,
-{
+impl<B: ReadBuffer, F: AsRawFd + Send + 'static> Op<Read<B, F>> {
     /// Submit a read operation via io-uring.
     ///
     /// `max_len` is the maximum number of bytes to read.
@@ -109,13 +82,13 @@ where
     pub(crate) fn read_at(fd: F, mut buf: B, max_len: usize, offset: u64) -> Self {
         let (ptr, len) = buf.uring_read_prepare(max_len);
 
-        let sqe = opcode::Read::new(types::Fd(UringFd::as_raw_fd(&fd)), ptr, len)
+        let sqe = opcode::Read::new(types::Fd(fd.as_raw_fd()), ptr, len)
             .offset(offset)
             .build();
 
-        // SAFETY: `fd` and `buf`, which owns the heap buffer, are moved into `Read`,
-        // which is held by the `Op` for the entire duration of the io-uring operation.
-        // The buffer pointer remains valid because Vec heap data doesn't move.
+        // SAFETY: Read keeps the fd and buffer alive until the CQE, even if the
+        // future gets dropped. ReadBuffer guarantees the pointer survives moves
+        // and remains valid for exclusive kernel writes until completion.
         unsafe { Op::new(sqe, Read { fd, buf }) }
     }
 }

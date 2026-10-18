@@ -34,7 +34,7 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
         // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
         any(target_env = "gnu", target_os = "android")
     )]
-    let size_hint = Op::file_metadata(&file)?
+    let size_hint = Op::file_metadata(&file)
         .await
         .map(|m| m.len() as usize)
         .ok();
@@ -53,6 +53,9 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
     read_to_end_uring(fd, buf).await
 }
 
+// NOTE: kept callback chaining for a follow-up PR. The callback would submit
+// the next chunk directly, waking this future only to grow the buffer
+// or return the result.
 async fn read_to_end_uring(mut fd: OwnedFd, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut offset = 0;
     let start_cap = buf.capacity();
@@ -135,20 +138,17 @@ async fn op_read(
     loop {
         let (res, r_fd, r_buf) = Op::read_at(fd, buf, read_len as usize, *offset).await;
 
-        match (res, r_fd, r_buf) {
-            // Retry an interrupted read with the buffer the op handed back. A
-            // cancelled op returns no buffer, so it falls through as terminal.
-            (Err(e), Some(r_fd), Some(r_buf)) if e.kind() == ErrorKind::Interrupted => {
+        match res {
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
                 buf = r_buf;
                 fd = r_fd;
             }
-            (Err(e), ..) => return Err(e),
-            (Ok(size_read), Some(r_fd), Some(r_buf)) => {
+            Err(e) => return Err(e),
+            Ok(size_read) => {
                 *offset += size_read as u64;
 
                 return Ok((r_fd, r_buf, size_read == 0));
             }
-            (Ok(_), ..) => unreachable!("a successful read returns its fd and buffer"),
         }
     }
 }

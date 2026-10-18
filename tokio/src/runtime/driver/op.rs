@@ -1,264 +1,164 @@
-use crate::io::blocking::Buf;
-use crate::io::uring::open::Open;
-use crate::io::uring::read::Read;
-use crate::io::uring::rename::Rename;
-use crate::io::uring::utils::ArcFd;
-use crate::io::uring::write::Write;
+use crate::io::uring::Uring;
+use crate::loom::sync::Arc;
+use crate::runtime::{context, Handle};
+use crate::task::coop;
 
-use crate::runtime::io::RegisterResult;
-use crate::runtime::Handle;
-
-#[cfg(
-    // libc::statx is only supported on these platforms
-    // FIXME: Add musl target env when our minimum supported
-    // rust version is 1.93. To clarify, statx support is
-    // introduced to musl in 1.25 as mentioned officially here:
-    // https://musl.libc.org/releases.html.
-    // However, rustup target_env building for *-linux-musl
-    // uses 1.25 musl on all *-linux-musl platforms starting
-    // in 1.93 stable rust version.
-    // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
-    any(target_env = "gnu", target_os = "android")
-)]
-use crate::io::uring::statx::Statx;
 use io_uring::cqueue;
 use io_uring::squeue::Entry;
 use std::future::Future;
 use std::io;
 use std::mem;
-use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{ready, Context, Poll};
 
-// This field isn't accessed directly, but it holds cancellation data,
-// so `#[allow(dead_code)]` is needed.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CancelData {
-    Open(Open),
-    Write(Write),
-    Rename(Rename),
-    ReadVec(Read<Vec<u8>, OwnedFd>),
-    ReadBuf(Read<Buf, ArcFd>),
-    #[cfg(
-        // libc::statx is only supported on these platforms
-        // FIXME: Add musl target env when our minimum supported
-        // rust version is 1.93. To clarify, statx support is
-        // introduced to musl in 1.25 as mentioned officially here:
-        // https://musl.libc.org/releases.html.
-        // However, rustup target_env building for *-linux-musl
-        // uses 1.25 musl on all *-linux-musl platforms starting
-        // in 1.93 stable rust version.
-        // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
-        any(target_env = "gnu", target_os = "android")
-    )]
-    Statx(Statx),
-}
+// NOTE/TODO: no loom cover for SQE publication race
+mod completion;
+pub(crate) use completion::Completable;
+use completion::CompletionState;
 
-#[derive(Debug)]
-pub(crate) enum Lifecycle {
-    /// The operation has been submitted to uring and is currently in-flight
-    Submitted,
-
-    /// The submitter is waiting for the completion of the operation
-    Waiting(Waker),
-
-    /// The submitter no longer has interest in the operation result. The state
-    /// must be passed to the driver and held until the operation completes.
-    Cancelled(
-        // This field isn't accessed directly, but it holds cancellation data,
-        // so `#[allow(dead_code)]` is needed.
-        #[allow(dead_code)] CancelData,
-    ),
-
-    /// The operation has completed with a single cqe result
-    Completed(cqueue::Entry),
-}
-
-pub(crate) enum State {
-    Initialize(Option<Entry>),
-    Polled(usize),
+enum State<T: Completable> {
+    Initialize {
+        entry: Entry,
+        data: T,
+    },
+    Unsubmitted {
+        entry: Entry,
+        completion: Arc<CompletionState<T>>,
+    },
+    // NOTE: fatal ring failure can leave this pending forever. Read/write outputs
+    // return the fd and buffer, so an error alone can't complete them before kernel
+    // access ends. An early error would need an output that can omit those ressources.
+    // Would you be OK with that retention for this PR, or do we need the output
+    // change first? (didn't do it because it would make the PR even bigger)
+    Submitted(Arc<CompletionState<T>>),
     Complete,
 }
 
-pub(crate) struct Op<T: Cancellable> {
-    // Handle to the runtime
-    handle: Handle,
-    // State of this Op
-    state: State,
-    // Per operation data.
-    data: Option<T>,
+pub(crate) struct Op<T: Completable> {
+    uring: Uring,
+    state: State<T>,
 }
 
-impl<T: Cancellable> Op<T> {
+impl<T: Completable> Op<T> {
     /// # Safety
     ///
-    /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
-    /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
+    /// The entry can only point at ressources that `data` keeps alive until completion.
+    /// Moving `data` must not invalidate those pointers. The entry must produce
+    /// exactly one CQE, so no `multishot` and no `SKIP_SUCCESS`. its result must be
+    /// nonnegative or a -errno, as for builtin filesystem operations.
     pub(crate) unsafe fn new(entry: Entry, data: T) -> Self {
-        let handle = Handle::current();
         Self {
-            handle,
-            data: Some(data),
-            state: State::Initialize(Some(entry)),
-        }
-    }
-    pub(crate) fn take_data(&mut self) -> Option<T> {
-        self.data.take()
-    }
-}
-
-impl<T: Cancellable> Drop for Op<T> {
-    fn drop(&mut self) {
-        match self.state {
-            // We've already dropped this Op.
-            State::Complete => (),
-            // We will cancel this Op.
-            State::Polled(index) => {
-                let data = self.take_data();
-                let handle = &mut self.handle;
-                handle.inner.driver().io().cancel_op(index, data);
-            }
-            // This Op has not been polled yet.
-            // We don't need to do anything here.
-            State::Initialize(_) => (),
+            uring: Uring::from_io(Handle::current().inner.driver().io()),
+            state: State::Initialize { entry, data },
         }
     }
 }
 
-/// A single CQE result
-pub(crate) struct CqeResult {
-    pub(crate) result: io::Result<u32>,
+unsafe fn op_complete<T: Completable>(_: &Uring, cqe: cqueue::Entry, state: *mut ()) {
+    // SAFETY: one CQE takes back the callback's Arc. Rejected submission instead
+    // reclaims it in poll and cannot call us. The CQE ends kernel access to data.
+    unsafe {
+        CompletionState::complete(
+            Arc::from_raw(state.cast::<CompletionState<T>>()),
+            cqe.result(),
+        )
+    };
 }
 
-impl From<cqueue::Entry> for CqeResult {
-    fn from(cqe: cqueue::Entry) -> Self {
-        let res = cqe.result();
-        let result = if res >= 0 {
-            Ok(res as u32)
-        } else {
-            Err(io::Error::from_raw_os_error(-res))
-        };
-        CqeResult { result }
-    }
-}
+impl<T: Completable> Unpin for Op<T> {}
 
-/// A trait that converts a CQE result into a usable value for each operation.
-pub(crate) trait Completable {
-    type Output;
-    fn complete(self, cqe: CqeResult) -> Self::Output;
-
-    // This is used when you want to terminate an operation with an error.
-    //
-    // The `Op` type that implements this trait can return the passed error
-    // upstream by embedding it in the `Output`.
-    fn complete_with_error(self, error: io::Error) -> Self::Output;
-
-    // Like `complete_with_error`, but for an op cancelled after the SQE reached
-    // the kernel: its resources stay with the driver and are not returned.
-    fn complete_after_cancel(error: io::Error) -> Self::Output;
-}
-
-/// Extracts the `CancelData` needed to safely cancel an in-flight io_uring operation.
-pub(crate) trait Cancellable {
-    fn cancel(self) -> CancelData;
-}
-
-impl<T: Cancellable> Unpin for Op<T> {}
-
-impl<T: Cancellable + Completable + Send> Future for Op<T> {
+impl<T: Completable> Future for Op<T> {
     type Output = T::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-
-        match &mut this.state {
-            State::Initialize(entry_opt) => {
-                let entry = entry_opt.take().expect("Entry must be present");
-                let waker = cx.waker().clone();
-
-                let driver = this.handle.inner.driver().io();
-                // SAFETY: entry is valid for the entire duration of the operation
-                let result = unsafe { driver.register_op(entry, waker) };
-
-                match result {
-                    RegisterResult::Submitted(idx) => this.state = State::Polled(idx),
-
-                    // The kernel never saw the entry, so the resources go back to
-                    // the caller with the error.
-                    RegisterResult::NotPushed(err) => {
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on Initialization");
-
-                        this.state = State::Complete;
-
-                        return Poll::Ready(data.complete_with_error(err));
-                    }
-
-                    // The kernel may have seen the entry, so cancel to keep the
-                    // resources alive until completion instead of returning them.
-                    RegisterResult::Pushed { index, error } => {
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on Initialization");
-
-                        this.handle.inner.driver().io().cancel_op(index, Some(data));
-
-                        this.state = State::Complete;
-
-                        return Poll::Ready(T::complete_after_cancel(error));
-                    }
-                };
-
-                Poll::Pending
-            }
-
-            State::Polled(idx) => {
-                let driver = this.handle.inner.driver().io();
-                let mut ctx = driver.get_uring().lock();
-                let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
-
-                match mem::replace(lifecycle, Lifecycle::Submitted) {
-                    // Only replace the stored waker if it wouldn't wake the new one
-                    Lifecycle::Waiting(prev) if !prev.will_wake(cx.waker()) => {
-                        let waker = cx.waker().clone();
-                        *lifecycle = Lifecycle::Waiting(waker);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Waiting(prev) => {
-                        *lifecycle = Lifecycle::Waiting(prev);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Completed(cqe) => {
-                        // Clean up and complete the future
-                        ctx.remove_op(*idx);
-
-                        this.state = State::Complete;
-
-                        drop(ctx);
-
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on completion");
-                        Poll::Ready(data.complete(cqe.into()))
-                    }
-
-                    Lifecycle::Submitted => {
-                        unreachable!("Submitted lifecycle should never be seen here");
-                    }
-
-                    Lifecycle::Cancelled(_) => {
-                        unreachable!("Cancelled lifecycle should never be seen here");
-                    }
-                }
-            }
-
-            State::Complete => {
-                panic!("Future polled after completion");
-            }
+        ready!(crate::trace::trace_leaf(cx));
+        let coop = ready!(coop::poll_proceed(cx));
+        if matches!(this.state, State::Initialize { .. }) {
+            let State::Initialize { entry, data } = mem::replace(&mut this.state, State::Complete)
+            else {
+                unreachable!();
+            };
+            this.state = State::Unsubmitted {
+                entry,
+                completion: Arc::new(CompletionState::new(data)),
+            };
         }
+        if let State::Unsubmitted { completion, .. } = &this.state {
+            // register before publication so early completion wake the first Pending.
+            completion.waker.register_by_ref(cx.waker());
+            let State::Unsubmitted { entry, completion } =
+                mem::replace(&mut this.state, State::Complete)
+            else {
+                unreachable!();
+            };
+            let state = Arc::into_raw(completion.clone());
+            // mark submitted before publication. If submit unwinds, repoll must
+            // not publish these resources again. Only proven rejection allows retry.
+            this.state = State::Submitted(completion);
+            // dropping the future abandons its result. The callback keeps the
+            // data even if the future is forgotten. Cancel-on-drop needs a separate
+            // SQE and still cannot release resources before the target CQE.
+            // SAFETY: new's contract keeps SQE resources in completion. Only Err allow
+            // reclaiming the callback Arc. On Ok the callback may already have run.
+            if let Err(error) = unsafe {
+                this.uring
+                    .submit(entry.clone(), op_complete::<T>, state.cast_mut().cast())
+            } {
+                // SAFETY: rejection guarantees no kernel use and no callback.
+                drop(unsafe { Arc::from_raw(state) });
+                let State::Submitted(completion) = mem::replace(&mut this.state, State::Complete)
+                else {
+                    unreachable!();
+                };
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    this.state = State::Unsubmitted { entry, completion };
+                    // NOTE: pressure retries still repoll without capacity changing.
+                    // Waiters need notifications on SQ consumption, slot release and
+                    // failure/shutdown. Required before merge, or a separate change?
+                    context::defer(cx.waker());
+                    return Poll::Pending;
+                }
+                coop.made_progress();
+                // SAFETY: rejection guarantees no kernel use or callback. Keep completion
+                // alive until the output exists, before dropping its possibly panicking waker.
+                return Poll::Ready(unsafe { completion.take_data() }.complete(Err(error)));
+            }
+            // Keep the first-poll yield, including completion before submit returns.
+            return Poll::Pending;
+        }
+        let State::Submitted(completion) = &this.state else {
+            panic!("Future polled after completion");
+        };
+        let result = completion.result().or_else(|| {
+            completion.waker.register_by_ref(cx.waker());
+            completion.result()
+        });
+        let Some(result) = result else {
+            return Poll::Pending;
+        };
+        let State::Submitted(completion) = mem::replace(&mut this.state, State::Complete) else {
+            unreachable!();
+        };
+        coop.made_progress();
+        // SAFETY: this future alone takes data, after acquiring the terminal result.
+        // Construct the output before completion drops, so a waker drop panic cannot
+        // lose a successful open's raw fd.
+        Poll::Ready(unsafe { completion.take_data() }.complete(result))
+    }
+}
+
+impl<T: Completable> Drop for Op<T> {
+    fn drop(&mut self) {
+        // A stranded callback shouldnt keep the tasks waker.
+        let waker = match &self.state {
+            State::Unsubmitted { completion, .. } | State::Submitted(completion) => {
+                completion.waker.take_waker()
+            }
+            _ => None,
+        };
+        // If this is the last Arc, finish cleanup before the waker can panic.
+        drop(mem::replace(&mut self.state, State::Complete));
+        drop(waker);
     }
 }
