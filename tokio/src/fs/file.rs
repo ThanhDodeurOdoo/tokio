@@ -1147,7 +1147,6 @@ impl Inner {
             if let Some(driver_handle) = handle.inner.driver().io.as_ref() {
                 if driver_handle
                     .check_and_init(io_uring::opcode::Read::CODE)
-                    .await
                     .unwrap_or_default()
                 {
                     return Self::uring_read(std, buf, max_buf_size).await;

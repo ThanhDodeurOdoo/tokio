@@ -2,7 +2,7 @@ use super::super::{Driver, Handle};
 use super::INDEX_MASK;
 use crate::io::uring::Uring;
 
-use io_uring::{opcode, Probe};
+use io_uring::opcode;
 use std::os::fd::AsRawFd;
 
 // Builds a driver whose io_uring context is initialized, or returns `None` when
@@ -10,11 +10,10 @@ use std::os::fd::AsRawFd;
 fn ready_handle() -> Option<(Driver, Handle)> {
     let (driver, handle) = Driver::new(1024, None).ok()?;
 
-    let mut probe = Probe::new();
-    handle.try_init(&mut probe).ok()?;
-    handle.uring.probe.set(Some(probe)).unwrap();
-
-    Some((driver, handle))
+    handle
+        .check_and_init(opcode::Nop::CODE)
+        .ok()?
+        .then_some((driver, handle))
 }
 
 // Makes the next submission fail with a non-`EBUSY` error by pointing the ring's
@@ -127,7 +126,7 @@ mod panic_tests {
             })
             .build()
             .unwrap();
-        match rt.block_on(Uring::new(rt.handle())) {
+        match Uring::new(rt.handle()) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
             Err(error) => panic!("io_uring initialization failed: {error}"),

@@ -3,13 +3,13 @@ use crate::io::Interest;
 use crate::loom::sync::atomic::{AtomicU32, Ordering};
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime::{context, scheduler};
-use crate::sync::OnceCell;
 use io_uring::{cqueue, opcode, squeue::Entry, IoUring, Probe};
 use mio::unix::SourceFd;
 use slab::Slab;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::{Handle, TOKEN_WAKEUP};
@@ -41,7 +41,7 @@ pub(crate) struct UringShared {
     // out of the mutex so waking the driver doesn't need the ring lock
     waker: Arc<mio::Waker>,
     admission: Arc<UringAdmission>,
-    probe: OnceCell<Option<Probe>>,
+    probe: OnceLock<Option<Probe>>,
 }
 
 impl UringShared {
@@ -51,7 +51,7 @@ impl UringShared {
             context: Mutex::new(UringContext::new(admission.clone())),
             waker,
             admission,
-            probe: OnceCell::new(),
+            probe: OnceLock::new(),
         }
     }
 
@@ -576,14 +576,11 @@ impl Handle {
     }
 
     /// Initialize if needed, then check opcode support.
-    /// Returns `Ok(false)` if the ring is unsupported or failed, or if the opcode isn't
-    /// supported. After shutdown it returns the runtime-shutdown error recognized by
-    /// `crate::runtime::is_rt_shutdown_err`. Other unexpected syscall errors are passed through.
-    ///
-    /// TODO: This would like to be a synchronous function,
-    /// but we require `OnceLock::get_or_try_init`.
-    /// <https://github.com/rust-lang/rust/issues/109737>
-    pub(crate) async fn check_and_init(&self, opcode: u8) -> io::Result<bool> {
+    /// Returns `Ok(false)` for unsupported rings/opcodes or a failure seen at entry.
+    /// Failure while waiting for initialization can return the ring's stored OS error.
+    /// Shutdown returns the error recognized by `crate::runtime::is_rt_shutdown_err`.
+    /// Other setup errors are passed through.
+    pub(crate) fn check_and_init(&self, opcode: u8) -> io::Result<bool> {
         let state = self.uring.admission.state.load(Ordering::Acquire);
         if state & SHUTDOWN_BIT != 0 {
             return Err(closed());
@@ -591,31 +588,37 @@ impl Handle {
         if state & ERROR_MASK != 0 {
             return Ok(false);
         }
-        let probe = self
-            .uring
-            .probe
-            .get_or_try_init(|| async {
-                let mut probe = Probe::new();
-                match self.try_init(&mut probe) {
-                    Ok(()) => Ok(Some(probe)),
-                    Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Ok(None),
-                    // EPERM can mean seccomp blocked io_uring. Remember that so later calls
-                    // go straight to spawn_blocking.
-                    // https://github.com/tokio-rs/tokio/issues/7691
-                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            })
-            .await?;
+        let probe = match self.uring.probe.get() {
+            Some(probe) => probe,
+            None => self.init_probe()?,
+        };
 
         Ok(probe
             .as_ref()
             .is_some_and(|probe| probe.is_supported(opcode)))
     }
 
-    fn try_init(&self, probe: &mut Probe) -> io::Result<()> {
+    fn init_probe(&self) -> io::Result<&Option<Probe>> {
         let mut guard = self.uring.context.lock();
         guard.admission.check()?;
+        if let Some(probe) = self.uring.probe.get() {
+            return Ok(probe);
+        }
+        let mut probe = Probe::new();
+        let probe = match self.try_init(&mut guard, &mut probe) {
+            Ok(()) => Some(probe),
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+            // EPERM can mean seccomp blocked io_uring. Remember that so later calls
+            // go straight to spawn_blocking.
+            // https://github.com/tokio-rs/tokio/issues/7691
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => None,
+            Err(e) => return Err(e),
+        };
+        // Publish before unlocking so another initializer cannot replace the ring.
+        Ok(self.uring.probe.get_or_init(|| probe))
+    }
+
+    fn try_init(&self, guard: &mut UringContext, probe: &mut Probe) -> io::Result<()> {
         let uring = IoUring::new(DEFAULT_RING_SIZE)?;
         // We can't reclaim resources without their CQEs. with NODROP the kernel buffers
         // overflowing CQEs instead of dropping them. that allocation can still fail though

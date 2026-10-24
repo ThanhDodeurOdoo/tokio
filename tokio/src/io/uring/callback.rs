@@ -57,22 +57,23 @@ impl OperationId {
 impl Uring {
     /// Returns a handle to this runtime's ring, initializing it if needed.
     ///
+    /// Setup blocks the calling thread. Concurrent callers may wait.
+    /// Unsupported results are cached. Other setup errors let later calls retry.
+    ///
     /// # Errors
     ///
     ///  - [`io::ErrorKind::Unsupported`] if runtime I/O is disabled or io_uring is unavailable
-    ///  - [`io::ErrorKind::Other`] if the runtime has shut down. 
-    ///  - [`io::Error`] for other initialisation errors and failed ring's stored OS error.
-    pub async fn new(handle: &crate::runtime::Handle) -> io::Result<Self> {
-        // callbacks can't await lazy initialization when they resubmit.
-        // I kept this async to reuse the driver's OnceCell, would it make sense
-        // to work on making it sync separately?
+    ///  - [`io::ErrorKind::Other`] if the runtime has shut down.
+    ///  - [`io::Error`] for other setup errors or a failed ring's stored OS error.
+    ///    A failed ring is not reinitialized.
+    pub fn new(handle: &crate::runtime::Handle) -> io::Result<Self> {
         let driver = handle.inner.driver().io.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "runtime I/O is disabled. Call enable_io on the runtime builder",
             )
         })?;
-        let available = driver.check_and_init(opcode::Nop::CODE).await?;
+        let available = driver.check_and_init(opcode::Nop::CODE)?;
         // fs can fall back to blocking io, but custom callers need the stored ring failure.
         // Initialization errors ENOSYS and EPERM still become Unsupported below.
         driver.check_uring_admission()?;
