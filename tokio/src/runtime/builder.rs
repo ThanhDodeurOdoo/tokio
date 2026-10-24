@@ -165,16 +165,20 @@ cfg_unstable! {
     /// How the runtime should respond to unhandled panics.
     ///
     /// Instances of `UnhandledPanic` are passed to `Builder::unhandled_panic`
-    /// to configure the runtime behavior when a spawned task panics.
+    /// to configure the runtime behavior when a spawned task or an io_uring
+    /// completion callback panics.
     ///
     /// See [`Builder::unhandled_panic`] for more details.
     #[derive(Debug, Clone)]
     #[non_exhaustive]
     pub enum UnhandledPanic {
-        /// The runtime should ignore panics on spawned tasks.
+        /// The runtime should continue running after an unhandled panic.
         ///
-        /// The panic is forwarded to the task's [`JoinHandle`] and all spawned
-        /// tasks continue running normally.
+        /// A spawned task's panic is forwarded to its [`JoinHandle`] and all
+        /// other spawned tasks continue running normally.
+        /// io_uring completion callback panics have no `JoinHandle` to receive
+        /// them. A callback that panics before waking its waiter may leave it
+        /// pending indefinitely.
         ///
         /// This is the default behavior.
         ///
@@ -216,6 +220,9 @@ cfg_unstable! {
         /// The runtime will immediately shutdown even if the panicked task's
         /// [`JoinHandle`] is still available. All further spawned tasks will be
         /// immediately dropped and call to [`Runtime::block_on`] will panic.
+        /// An io_uring completion callback panic during an I/O driver turn
+        /// also shuts down the runtime, after the current completion batch
+        /// finishes and its terminal registrations are removed.
         ///
         /// # Examples
         ///
@@ -1311,8 +1318,7 @@ impl Builder {
     }
 
     cfg_unstable! {
-        /// Configure how the runtime responds to an unhandled panic on a
-        /// spawned task.
+        /// Configure how the runtime responds to an unhandled panic.
         ///
         /// By default, an unhandled panic (i.e. a panic not caught by
         /// [`std::panic::catch_unwind`]) has no impact on the runtime's
@@ -1328,6 +1334,15 @@ impl Builder {
         ///   task's `JoinHandle` has not been dropped. All other spawned tasks
         ///   will immediately terminate and further calls to
         ///   [`Runtime::block_on`] will panic.
+        ///
+        /// With the `io-uring` feature, this policy also applies to completion
+        /// callbacks during io driver turns (including panics from wakers
+        /// invoked by builtin operations). The driver finish the completion
+        /// batch and removes terminal registrations before applying the policy.
+        /// These panics have no `JoinHandle` toreceive them. With `Ignore`, a
+        /// callback that panics before waking its waiter may leave it pending
+        /// indefinitely. During runtime shutdown, callback panics are contained
+        /// while the remaining completions are drained.
         ///
         /// # Panics
         /// This method panics if called with [`UnhandledPanic::ShutdownRuntime`]

@@ -55,6 +55,13 @@ impl OperationId {
 }
 
 impl Uring {
+    /// Returns a handle to this runtime's ring, initializing it if needed.
+    ///
+    /// # Errors
+    ///
+    ///  - [`io::ErrorKind::Unsupported`] if runtime I/O is disabled or io_uring is unavailable
+    ///  - [`io::ErrorKind::Other`] if the runtime has shut down. 
+    ///  - [`io::Error`] for other initialisation errors and failed ring's stored OS error.
     pub async fn new(handle: &crate::runtime::Handle) -> io::Result<Self> {
         // callbacks can't await lazy initialization when they resubmit.
         // I kept this async to reuse the driver's OnceCell, would it make sense
