@@ -86,6 +86,127 @@ fn publish_failure_preserves_accepted_entry() {
     assert_eq!(ctx.ring_mut().submission().len(), 1);
 }
 
+#[cfg(panic = "unwind")]
+mod panic_tests {
+    use super::*;
+    use crate::runtime::{Builder, UnhandledPanic};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct Completion {
+        calls: Arc<Mutex<Vec<(bool, i32)>>>,
+        panic: bool,
+    }
+
+    unsafe fn complete(
+        _: &mut Submission<'_>,
+        cqe: io_uring::cqueue::Entry,
+        state: *mut (),
+    ) -> CompletionAction {
+        // SAFETY: each NOP owns one Box and make exactly one terminal CQE.
+        let state = unsafe { Box::from_raw(state.cast::<Completion>()) };
+        state
+            .calls
+            .lock()
+            .unwrap()
+            .push((state.panic, cqe.result()));
+        if state.panic {
+            panic!("completion callback panic");
+        }
+        CompletionAction::Remove
+    }
+
+    fn same_batch_panic(builder: &mut Builder, shutdown: bool) {
+        let rt = builder
+            .enable_all()
+            .unhandled_panic(if shutdown {
+                UnhandledPanic::ShutdownRuntime
+            } else {
+                UnhandledPanic::Ignore
+            })
+            .build()
+            .unwrap();
+        match Uring::new(rt.handle()) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("io_uring initialization failed: {error}"),
+        }
+        let handle = rt.handle().inner.driver().io();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        {
+            // prevent the worker from detaching the first CQE before the second is ready.
+            let mut ctx = handle.uring.context.lock();
+            for (index, panic) in [true, false].into_iter().enumerate() {
+                let state = Box::into_raw(Box::new(Completion {
+                    calls: calls.clone(),
+                    panic,
+                }));
+                // SAFETY: NOP has no kernel pointers. The last callback reclaims
+                // its Box (including on unwind, without borrowing this test's stack).
+                let result =
+                    unsafe { ctx.publish(opcode::Nop::new().build(), complete, state.cast()) };
+                if result.is_err() {
+                    // SAFETY: rejection guarantees no callback or kernel use.
+                    drop(unsafe { Box::from_raw(state) });
+                }
+                result.unwrap();
+                ctx.ring().submit_and_wait(index + 1).unwrap();
+            }
+            assert_eq!(ctx.ring_mut().completion().len(), 2);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            rt.block_on(async {
+                crate::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        // A callback can finish before the worker remove its slot.
+                        let callbacks_done = calls.lock().unwrap().len() == 2;
+                        if callbacks_done && handle.uring.context.lock().ops.is_empty() {
+                            break;
+                        }
+                        crate::task::yield_now().await;
+                    }
+                    if shutdown {
+                        std::future::pending::<()>().await;
+                    }
+                })
+                .await
+            })
+        }));
+        if shutdown {
+            let panic = result.expect_err("callback panic did not shut down the runtime");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"the runtime is configured to shut down on unhandled panic")
+            );
+        } else {
+            result.unwrap().expect("completion batch did not finish");
+            rt.block_on(async {});
+        }
+        assert_eq!(*calls.lock().unwrap(), [(true, 0), (false, 0)]);
+        assert!(handle.uring.context.lock().ops.is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn same_batch_panic_current_thread_ignore() {
+        same_batch_panic(&mut Builder::new_current_thread(), false);
+    }
+
+    #[test]
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(miri, ignore)]
+    fn same_batch_panic_multi_thread_ignore() {
+        same_batch_panic(Builder::new_multi_thread().worker_threads(1), false);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn same_batch_panic_current_thread_shutdown() {
+        same_batch_panic(&mut Builder::new_current_thread(), true);
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn callback_resubmits_then_defers_wake() {

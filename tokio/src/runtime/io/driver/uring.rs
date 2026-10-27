@@ -3,6 +3,7 @@ use crate::io::Interest;
 use crate::loom::sync::atomic::{AtomicU32, Ordering};
 use crate::loom::sync::{Arc, Mutex, MutexGuard};
 use crate::runtime::driver::op::{CancelData, Cancellable, CqeResult, Lifecycle};
+use crate::runtime::{context, scheduler};
 use io_uring::{cqueue, opcode, squeue::Entry, IoUring, Probe};
 use mio::unix::SourceFd;
 use slab::Slab;
@@ -447,7 +448,17 @@ impl Handle {
             // Remaining CQEs may not produce another I/O notification.
             let _ = self.waker.wake();
         }
-        batch.finish();
+        if !batch.finish() {
+            // Apply the task panic policy after cleanup, since shutdown can drop
+            // tasks whose completions are in this batch.
+            catch_panic(|| {
+                context::with_scheduler(|context| {
+                    if let Some(scheduler::Context::CurrentThread(context)) = context {
+                        context.unhandled_io_panic();
+                    }
+                });
+            });
+        }
     }
 
     pub(super) fn shutdown_uring(&self) {

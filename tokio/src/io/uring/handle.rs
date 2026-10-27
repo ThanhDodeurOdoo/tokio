@@ -17,7 +17,7 @@ use std::task::Waker;
 /// During shutdown there may be no entered runtime and submissions are rejected.
 /// `submit` never call callbacks directly. Waiting for this driver's I/O can
 /// deadlock. During scheduler I/O turns, `block_in_place` and Tokio's `block_on` panic.
-/// Callback and deferred-waker panics are contained.
+/// Callback panics follow [`Builder::unhandled_panic`](crate::runtime::Builder::unhandled_panic).
 #[derive(Clone, Debug)]
 pub struct Uring {
     // Weak so stranded callback state cannot keep the context, slab and waker alive.
