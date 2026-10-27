@@ -165,16 +165,17 @@ cfg_unstable! {
     /// How the runtime should respond to unhandled panics.
     ///
     /// Instances of `UnhandledPanic` are passed to `Builder::unhandled_panic`
-    /// to configure the runtime behavior when a spawned task panics.
+    /// to configure the runtime behavior when a spawned task or an io_uring
+    /// completion callback panics.
     ///
     /// See [`Builder::unhandled_panic`] for more details.
     #[derive(Debug, Clone)]
     #[non_exhaustive]
     pub enum UnhandledPanic {
-        /// The runtime should ignore panics on spawned tasks.
+        /// The runtime should continue running after an unhandled panic.
         ///
-        /// The panic is forwarded to the task's [`JoinHandle`] and all spawned
-        /// tasks continue running normally.
+        /// A spawned task's panic is forwarded to its [`JoinHandle`] and all
+        /// other spawned tasks continue running normally.
         ///
         /// This is the default behavior.
         ///
@@ -1311,8 +1312,7 @@ impl Builder {
     }
 
     cfg_unstable! {
-        /// Configure how the runtime responds to an unhandled panic on a
-        /// spawned task.
+        /// Configure how the runtime responds to an unhandled panic.
         ///
         /// By default, an unhandled panic (i.e. a panic not caught by
         /// [`std::panic::catch_unwind`]) has no impact on the runtime's
@@ -1328,6 +1328,12 @@ impl Builder {
         ///   task's `JoinHandle` has not been dropped. All other spawned tasks
         ///   will immediately terminate and further calls to
         ///   [`Runtime::block_on`] will panic.
+        ///
+        /// With `io-uring`, this also covers callbacks and builtin wakers during I/O
+        /// driver turns. The batch and requested removals finish before applying the policy.
+        /// These panics have no `JoinHandle`. Under `Ignore`, a waiter may remain pending
+        /// forever. During shutdown, panics are contained while remaining completions drain.
+        /// todo fffff
         ///
         /// # Panics
         /// This method panics if called with [`UnhandledPanic::ShutdownRuntime`]
