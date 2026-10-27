@@ -1,6 +1,5 @@
 use super::super::{Driver, Handle};
 use super::RegisterResult;
-use crate::runtime::driver::op::Lifecycle;
 
 use io_uring::opcode;
 use std::os::fd::AsRawFd;
@@ -25,7 +24,7 @@ struct BrokenRing {
 
 impl BrokenRing {
     fn new(handle: &Handle) -> Self {
-        let ring_fd = handle.get_uring().lock().ring().as_raw_fd();
+        let ring_fd = handle.uring.context.lock().ring().as_raw_fd();
         let null = std::fs::File::open("/dev/null").unwrap();
         // SAFETY: `dup` and `dup2` are valid for any open file descriptor.
         let saved = unsafe { libc::dup(ring_fd) };
@@ -46,31 +45,42 @@ impl Drop for BrokenRing {
     }
 }
 
-// Once an entry is pushed onto the submission queue the kernel may already own
-// the buffer it points at, so a failing submission must keep the slot instead of
-// dropping the op and freeing the buffer while it is still in use.
+// Reject only the newest SQE proven unconsumed after a fatal enter failure.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn register_op_keeps_entry_on_submit_failure() {
+fn register_failure_preserves_accepted_entry() {
     let Some((_driver, handle)) = ready_handle() else {
         return;
     };
-
-    let broken = BrokenRing::new(&handle);
-
-    let entry = opcode::Nop::new().build();
-    // SAFETY: the no-op entry does not reference any buffer.
-    let res = unsafe { handle.register_op(entry, futures::task::noop_waker()) };
-
-    // The entry was pushed before the submit failed, so the slot is kept and its
-    // index handed back for the caller to cancel.
-    let RegisterResult::Pushed { index, .. } = res else {
-        panic!("expected Pushed after a post-push submit failure");
+    // SAFETY: NOP does not reference any buffer.
+    let accepted =
+        unsafe { handle.register_op(opcode::Nop::new().build(), futures::task::noop_waker()) };
+    let RegisterResult::Submitted(accepted) = accepted else {
+        panic!("first NOP was not submitted");
     };
-    assert!(matches!(
-        handle.get_uring().lock().ops.get(index),
-        Some(Lifecycle::Waiting(_))
-    ));
-
+    handle
+        .uring
+        .context
+        .lock()
+        .ring()
+        .submit_and_wait(1)
+        .unwrap();
+    let broken = BrokenRing::new(&handle);
+    // SAFETY: NOP does not reference any buffer.
+    let rejected =
+        unsafe { handle.register_op(opcode::Nop::new().build(), futures::task::noop_waker()) };
+    assert!(matches!(rejected, RegisterResult::NotPushed(_)));
+    {
+        let ctx = handle.uring.context.lock();
+        assert_eq!(ctx.ops.len(), 1);
+        assert!(ctx.ops.contains(accepted));
+    }
     drop(broken);
+    handle.dispatch_completions();
+    assert!(handle
+        .poll_op(accepted, &futures::task::noop_waker())
+        .is_ready());
+    let mut ctx = handle.uring.context.lock();
+    assert!(ctx.ops.is_empty());
+    assert_eq!(ctx.ring_mut().submission().len(), 1);
 }
