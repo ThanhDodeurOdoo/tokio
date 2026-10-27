@@ -84,3 +84,53 @@ fn register_failure_preserves_accepted_entry() {
     assert!(ctx.ops.is_empty());
     assert_eq!(ctx.ring_mut().submission().len(), 1);
 }
+
+// A completed builtin keeps its slot through shutdown until its future takes the CQE.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn completed_builtin_survives_shutdown() {
+    use super::{RegisterResult, UringShared};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+    use std::task::{Poll, Wake, Waker};
+
+    struct Probe {
+        shared: Arc<UringShared>,
+        wakes: AtomicUsize,
+    }
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            assert!(self.shared.context.try_lock().is_some());
+            self.wakes.fetch_add(1, SeqCst);
+        }
+    }
+    let Some((_driver, handle)) = ready_handle() else {
+        return;
+    };
+    let probe = Arc::new(Probe {
+        shared: handle.uring.clone(),
+        wakes: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(probe.clone());
+    // SAFETY: NOP doesn't point at any memory.
+    let result = unsafe { handle.register_op(opcode::Nop::new().build(), waker.clone()) };
+    let RegisterResult::Submitted(builtin) = result else {
+        panic!("builtin NOP was not submitted");
+    };
+    handle
+        .uring
+        .context
+        .lock()
+        .ring()
+        .submit_and_wait(1)
+        .unwrap();
+    handle.dispatch_completions();
+    assert_eq!(probe.wakes.load(SeqCst), 1);
+    handle.shutdown_uring();
+    assert!(handle.uring.context.lock().ops.contains(builtin));
+    let Poll::Ready(cqe) = handle.poll_op(builtin, &waker) else {
+        panic!("completed builtin lost its CQE");
+    };
+    assert_eq!(cqe.result(), 0);
+    assert!(handle.uring.context.lock().ops.is_empty());
+}
