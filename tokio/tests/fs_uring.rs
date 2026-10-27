@@ -126,6 +126,8 @@ fn open_many_files() {
 #[tokio::test]
 async fn shutdown_retries_interrupted_wait() {
     use std::os::unix::thread::JoinHandleExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::signal::unix::{signal, SignalKind};
     use tokio::time::timeout;
 
@@ -149,6 +151,9 @@ async fn shutdown_retries_interrupted_wait() {
     let mut signal = signal(SignalKind::user_defined1()).unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let open_path = path.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let shutdown_completed = completed.clone();
+    let (release_tx, release_rx) = mpsc::channel();
     let shutdown = std::thread::spawn(move || {
         let rt = current_rt()();
         // Initialise io_uring before polling the operation we will cancel.
@@ -162,31 +167,40 @@ async fn shutdown_retries_interrupted_wait() {
         // SAFETY: gettid take no arguments and returns this thread's ID.
         tx.send(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
         drop(rt);
+        shutdown_completed.store(true, Ordering::Release);
+        // Keep the signal target alive until the interrupt attempt finishes.
+        let _ = release_rx.recv();
     });
 
     let pthread = shutdown.as_pthread_t();
     let interrupt_result = tokio::spawn(timeout(TIMEOUT, async move {
         let tid = rx.await.unwrap();
         let syscall_path = format!("/proc/self/task/{tid}/syscall");
-        let syscall_number = format!("{} ", libc::SYS_io_uring_enter);
-        let wait_for_uring_enter = || async {
+        let syscall_number = format!("{} ", libc::SYS_poll);
+        let wait_for_shutdown_wait = || async {
             while !std::fs::read_to_string(&syscall_path)
                 .unwrap()
                 .starts_with(&syscall_number)
             {
+                if completed.load(Ordering::Acquire) {
+                    return false;
+                }
                 tokio::task::yield_now().await;
             }
+            true
         };
-        // The FIFO has no reader, so shutdown must wait for the cancelled open.
-        wait_for_uring_enter().await;
+        // Cancellation can finish shutdown before it needs to wait.
+        if !wait_for_shutdown_wait().await {
+            return;
+        }
         // SAFETY: the join handle keeps the thread ID valid, and SIGUSR1 has a handler.
         assert_eq!(
             unsafe { libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1) },
             0
         );
         signal.recv().await.unwrap();
-        // After signal delivry, another wait proves shutdown retried before we release the FIFO.
-        wait_for_uring_enter().await;
+        // After the signal, shutdown must either retry the wait or finish cancelling.
+        wait_for_shutdown_wait().await;
     }))
     .await;
 
@@ -196,6 +210,7 @@ async fn shutdown_retries_interrupted_wait() {
         .write(true)
         .open(path)
         .unwrap();
+    let _ = release_tx.send(());
     timeout(TIMEOUT, async {
         while !shutdown.is_finished() {
             tokio::task::yield_now().await;

@@ -173,6 +173,9 @@ impl Driver {
 
     pub(crate) fn shutdown(&mut self, rt_handle: &driver::Handle) {
         let handle = rt_handle.io();
+        cfg_io_uring!({
+            handle.shutdown_uring();
+        });
         let ios = handle.registrations.shutdown(&mut handle.synced.lock());
 
         // `shutdown()` must be called without holding the lock.

@@ -2,7 +2,7 @@ use crate::io::Interest;
 use crate::loom::sync::atomic::{AtomicU32, Ordering};
 use crate::loom::sync::{Arc, Mutex, MutexGuard};
 use crate::runtime::driver::op::{CancelData, Cancellable, CqeResult, Lifecycle};
-use io_uring::{cqueue, squeue::Entry, IoUring, Probe};
+use io_uring::{cqueue, opcode, squeue::Entry, IoUring, Probe};
 use mio::unix::SourceFd;
 use slab::Slab;
 use std::any::Any;
@@ -12,12 +12,16 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use super::{Handle, TOKEN_WAKEUP};
 
 const DEFAULT_RING_SIZE: u32 = 256;
 // Bound all CQEs, including cancel replies, so refill loops can't starve tasks.
 const COMPLETION_BATCH_SIZE: usize = 32;
+const SHUTDOWN_POLL_TIMEOUT_MS: libc::c_int = 100;
+const SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(1);
+const CANCEL_USER_DATA: u64 = u64::MAX;
 const SHUTDOWN_BIT: u32 = 1 << 31;
 const ERROR_MASK: u32 = SHUTDOWN_BIT - 1;
 
@@ -91,6 +95,10 @@ impl UringAdmission {
 
     fn failed(&self) -> bool {
         self.state.load(Ordering::Acquire) & ERROR_MASK != 0
+    }
+
+    fn close(&self) {
+        self.state.fetch_or(SHUTDOWN_BIT, Ordering::Release);
     }
 
     fn record_result(&self, result: io::Result<usize>) {
@@ -179,29 +187,6 @@ pub(crate) struct UringContext {
 
 impl Drop for UringContext {
     fn drop(&mut self) {
-        // Until shutdown moves to the driver, retain the original wait for terminal CQEs.
-        if self.uring.is_some() {
-            while self.awaits_cqes() {
-                let batch = self.completions(COMPLETION_BATCH_SIZE);
-                self.flush();
-                batch.finish();
-                if !self.awaits_cqes() {
-                    break;
-                }
-                if self.admission.failed() {
-                    if self.ring_mut().completion().is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                // Queued SQEs must reach the kernel before waiting for their CQEs.
-                if self.ring_mut().submission().is_empty() {
-                    let result = self.ring().submit_and_wait(1);
-                    self.admission.record_result(result);
-                    self.check_cq_loss();
-                }
-            }
-        }
         for operation in self.ops.drain() {
             if let Lifecycle::Cancelled(data) = operation {
                 // Without a terminal CQE, the kernel may still use this data.
@@ -305,6 +290,9 @@ impl UringContext {
                 break;
             };
             batch.consumed += 1;
+            if cqe.user_data() == CANCEL_USER_DATA {
+                continue;
+            }
             let index = cqe.user_data() as usize;
             match self.ops.get_mut(index) {
                 Some(lifecycle @ Lifecycle::Waiting(_)) => {
@@ -368,6 +356,111 @@ impl Handle {
             let _ = self.waker.wake();
         }
         batch.finish();
+    }
+
+    pub(super) fn shutdown_uring(&self) {
+        let ids = {
+            let ctx = self.uring.context.lock();
+            // No new registrations may reuse these IDs while shutdown queues cancels.
+            ctx.admission.close();
+            if ctx.uring.is_none() {
+                return;
+            }
+            ctx.ops
+                .iter()
+                .filter(|(_, lifecycle)| !matches!(lifecycle, Lifecycle::Completed(_)))
+                .map(|(index, _)| index as u64)
+                .collect::<Vec<_>>()
+        };
+        let mut cancels = ids.into_iter().peekable();
+        let mut failed_remaining = None;
+        loop {
+            let batch;
+            let made_progress = {
+                let mut ctx = self.uring.context.lock();
+                ctx.check_cq_loss();
+                if ctx.admission.failed() && failed_remaining.is_none() {
+                    // Multishot CQEs can keep arriving after failure disables cancellation.
+                    failed_remaining = Some(ctx.ring_mut().completion().len());
+                }
+                batch = ctx.completions(failed_remaining.unwrap_or(COMPLETION_BATCH_SIZE));
+                if let Some(remaining) = &mut failed_remaining {
+                    *remaining -= batch.consumed;
+                }
+                let queued = ctx.ring_mut().submission().len();
+                ctx.flush();
+                let mut made_progress =
+                    batch.consumed != 0 || ctx.ring_mut().submission().len() < queued;
+                // Submit all targets before their cancels, including SQEs left queued by EINTR.
+                if !ctx.admission.failed() && ctx.ring_mut().submission().is_empty() {
+                    while let Some(&id) = cancels.peek() {
+                        let entry = opcode::AsyncCancel::new(id)
+                            .build()
+                            .user_data(CANCEL_USER_DATA);
+                        // SAFETY: AsyncCancel doesn't point at any memory.
+                        if unsafe { ctx.ring_mut().submission().push(&entry) }.is_err() {
+                            break;
+                        }
+                        cancels.next();
+                        made_progress = true;
+                    }
+                    ctx.flush();
+                }
+                made_progress |= !ctx.ring_mut().completion().is_empty();
+                made_progress
+            };
+            batch.finish();
+            if failed_remaining == Some(0) || !self.uring.context.lock().awaits_cqes() {
+                break;
+            }
+            if failed_remaining.is_some() {
+                continue;
+            }
+            let waited = cancels.peek().is_none() && self.wait_for_uring_completions();
+            if !made_progress && !waited && !self.uring.admission.failed() {
+                std::thread::sleep(SHUTDOWN_RETRY_DELAY);
+            }
+        }
+        self.uring.context.lock().uring = None;
+    }
+
+    fn wait_for_uring_completions(&self) -> bool {
+        let mut ctx = self.uring.context.lock();
+        ctx.check_cq_loss();
+        if ctx.admission.failed() || !ctx.ring_mut().submission().is_empty() {
+            return false;
+        }
+        // Admission is closed, so only shutdown uses the ring while the mutex is released.
+        debug_assert!(ctx.admission.state.load(Ordering::Acquire) & SHUTDOWN_BIT != 0);
+        let mut ring = ctx.uring.take().unwrap();
+        drop(ctx);
+        let result = ring.submit();
+        let result = result.and_then(|submitted| {
+            if ring.completion().overflow() != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADR));
+            }
+            // TODO recheck doc
+            // Older kernels may not wake enter on CQE loss. Timed poll rechecks loss
+            // without EXT_ARG. Nonblocking enter runs task work and drains overflow.
+            let mut fd = libc::pollfd {
+                fd: ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: fd is one initialized pollfd and the ring keeps its fd open.
+            let result = unsafe { libc::poll(&mut fd, 1, SHUTDOWN_POLL_TIMEOUT_MS) };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(submitted)
+            }
+        });
+        let mut ctx = self.uring.context.lock();
+        ctx.uring = Some(ring);
+        let waited = result.is_ok();
+        ctx.admission.record_result(result);
+        ctx.check_cq_loss();
+        waited
     }
 
     #[cfg_attr(test, allow(dead_code))]
