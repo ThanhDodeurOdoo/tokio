@@ -1,3 +1,4 @@
+use crate::io::uring::{CompletionAction, OperationId, Submission};
 use crate::io::Interest;
 use crate::loom::sync::atomic::{AtomicU32, Ordering};
 use crate::loom::sync::{Arc, Mutex, MutexGuard};
@@ -54,6 +55,22 @@ impl UringShared {
             admission,
             probe: OnceLock::new(),
         }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must respect `Uring::submit`'s safety requirements.
+    pub(crate) unsafe fn submit(
+        &self,
+        entry: Entry,
+        callback: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+        state: *mut (),
+    ) -> io::Result<OperationId> {
+        let mut context = self.context.lock();
+        // SAFETY: caller guarantees SQE ressources and callback state lifetimes.
+        let result = unsafe { context.publish(entry, callback, state) };
+        self.unlock(context);
+        result
     }
 
     fn unlock(&self, mut context: MutexGuard<'_, UringContext>) {
@@ -123,6 +140,26 @@ impl UringAdmission {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Callback {
+    function: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+    state: *mut (),
+}
+
+// SAFETY: submit requires callback state to be usable from the driver thread.
+unsafe impl Send for Callback {}
+
+enum Operation {
+    Builtin(Lifecycle),
+    Custom(Callback),
+}
+
+impl Operation {
+    fn awaits_cqe(&self) -> bool {
+        !matches!(self, Operation::Builtin(Lifecycle::Completed(_)))
+    }
+}
+
 fn release_cancelled(data: CancelData, cqe: cqueue::Entry) {
     let _fd = match (&data, CqeResult::from(cqe).result) {
         // SAFETY: this successful Open CQE yields a new file descriptor.
@@ -133,7 +170,9 @@ fn release_cancelled(data: CancelData, cqe: cqueue::Entry) {
 }
 
 struct CompletionBatch {
+    entries: [Option<(Callback, cqueue::Entry)>; COMPLETION_BATCH_SIZE],
     cancelled: [Option<(CancelData, cqueue::Entry)>; COMPLETION_BATCH_SIZE],
+    panics: [Option<Box<dyn Any + Send>>; COMPLETION_BATCH_SIZE],
     wakers: Vec<Waker>,
     consumed: usize,
 }
@@ -141,9 +180,42 @@ struct CompletionBatch {
 impl CompletionBatch {
     fn new() -> Self {
         Self {
+            entries: std::array::from_fn(|_| None),
             cancelled: std::array::from_fn(|_| None),
+            panics: std::array::from_fn(|_| None),
             wakers: Vec::new(),
             consumed: 0,
+        }
+    }
+
+    fn run(&mut self, ctx: &mut UringContext) {
+        for (index, entry) in self.entries[..self.consumed].iter_mut().enumerate() {
+            let Some((callback, cqe)) = entry else {
+                continue;
+            };
+            let mut action = if cqueue::more(cqe.flags()) {
+                CompletionAction::Keep
+            } else {
+                CompletionAction::Remove
+            };
+            // todo
+            let mut submission = Submission {
+                context: ctx,
+                wakers: &mut self.wakers,
+            };
+            // Payload destructors may submit too. so keep until after unlock.
+            self.panics[index] = catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: submit's caller keeps this state valid until this CQE is handled.
+                action =
+                    unsafe { (callback.function)(&mut submission, cqe.clone(), callback.state) };
+            }))
+            .err();
+            if action == CompletionAction::Keep {
+                *entry = None;
+            }
+        }
+        for (_, cqe) in self.entries[..self.consumed].iter().flatten() {
+            ctx.ops.remove(cqe.user_data() as usize);
         }
     }
 
@@ -158,6 +230,12 @@ impl CompletionBatch {
         for waker in self.wakers.drain(..) {
             // ffffff
             panicked |= catch_panic(|| waker.wake());
+        }
+        for payload in &mut self.panics[..self.consumed] {
+            if let Some(payload) = payload.take() {
+                panicked = true;
+                drop_panic(payload);
+            }
         }
         !panicked
     }
@@ -181,14 +259,14 @@ fn drop_panic(payload: Box<dyn Any + Send>) {
 
 pub(crate) struct UringContext {
     uring: Option<IoUring>,
-    ops: Slab<Lifecycle>,
+    ops: Slab<Operation>,
     admission: Arc<UringAdmission>,
 }
 
 impl Drop for UringContext {
     fn drop(&mut self) {
         for operation in self.ops.drain() {
-            if let Lifecycle::Cancelled(data) = operation {
+            if let Operation::Builtin(Lifecycle::Cancelled(data)) = operation {
                 // Without a terminal CQE, the kernel may still use this data.
                 mem::forget(data);
             }
@@ -247,11 +325,23 @@ impl UringContext {
         !sq.is_empty() || sq.cq_overflow()
     }
 
+    pub(crate) unsafe fn publish(
+        &mut self,
+        entry: Entry,
+        function: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+        state: *mut (),
+    ) -> io::Result<OperationId> {
+        let operation = Operation::Custom(Callback { function, state });
+        // SAFETY: the caller guarantees the entry and callback lifetimes.
+        let index = unsafe { self.push(entry, operation) }?;
+        Ok(OperationId(index as u64))
+    }
+
     /// # Safety
     ///
     /// The entry's resources must stay valid until its terminal CQE.
     /// A rejected `operation` drops under the lock, so it must own nothing.
-    unsafe fn push(&mut self, entry: Entry, operation: Lifecycle) -> io::Result<usize> {
+    unsafe fn push(&mut self, entry: Entry, operation: Operation) -> io::Result<usize> {
         self.admission.check()?;
         if self.ring_mut().submission().is_full() {
             self.flush();
@@ -285,7 +375,8 @@ impl UringContext {
             return batch;
         };
         let mut cq = ring.completion();
-        for cancelled in batch.cancelled.iter_mut().take(limit) {
+        let slots = batch.entries.iter_mut().zip(&mut batch.cancelled);
+        for (entry, cancelled) in slots.take(limit) {
             let Some(cqe) = cq.next() else {
                 break;
             };
@@ -295,7 +386,8 @@ impl UringContext {
             }
             let index = cqe.user_data() as usize;
             match self.ops.get_mut(index) {
-                Some(lifecycle @ Lifecycle::Waiting(_)) => {
+                Some(Operation::Custom(callback)) => *entry = Some((*callback, cqe)),
+                Some(Operation::Builtin(lifecycle @ Lifecycle::Waiting(_))) => {
                     let Lifecycle::Waiting(waker) =
                         mem::replace(lifecycle, Lifecycle::Completed(cqe))
                     else {
@@ -303,8 +395,9 @@ impl UringContext {
                     };
                     batch.wakers.push(waker);
                 }
-                Some(Lifecycle::Cancelled(_)) => {
-                    let Lifecycle::Cancelled(data) = self.ops.remove(index) else {
+                Some(Operation::Builtin(Lifecycle::Cancelled(_))) => {
+                    let Operation::Builtin(Lifecycle::Cancelled(data)) = self.ops.remove(index)
+                    else {
                         unreachable!()
                     };
                     *cancelled = Some((data, cqe));
@@ -320,9 +413,7 @@ impl UringContext {
     }
 
     fn awaits_cqes(&self) -> bool {
-        self.ops
-            .iter()
-            .any(|(_, lifecycle)| !matches!(lifecycle, Lifecycle::Completed(_)))
+        self.ops.iter().any(|(_, operation)| operation.awaits_cqe())
     }
 
     fn needs_turn(&mut self) -> bool {
@@ -344,11 +435,12 @@ impl Handle {
         if self.uring.probe.get().and_then(Option::as_ref).is_none() {
             return;
         }
-        let batch;
+        let mut batch;
         let needs_turn = {
             let mut ctx = self.uring.context.lock();
             batch = ctx.completions(COMPLETION_BATCH_SIZE);
             ctx.flush();
+            batch.run(&mut ctx);
             ctx.needs_turn()
         };
         if needs_turn {
@@ -368,14 +460,14 @@ impl Handle {
             }
             ctx.ops
                 .iter()
-                .filter(|(_, lifecycle)| !matches!(lifecycle, Lifecycle::Completed(_)))
+                .filter(|(_, operation)| operation.awaits_cqe())
                 .map(|(index, _)| index as u64)
                 .collect::<Vec<_>>()
         };
         let mut cancels = ids.into_iter().peekable();
         let mut failed_remaining = None;
         loop {
-            let batch;
+            let mut batch;
             let made_progress = {
                 let mut ctx = self.uring.context.lock();
                 ctx.check_cq_loss();
@@ -406,6 +498,7 @@ impl Handle {
                     }
                     ctx.flush();
                 }
+                batch.run(&mut ctx);
                 made_progress |= !ctx.ring_mut().completion().is_empty();
                 made_progress
             };
@@ -461,6 +554,10 @@ impl Handle {
         ctx.admission.record_result(result);
         ctx.check_cq_loss();
         waited
+    }
+
+    pub(crate) fn check_uring_admission(&self) -> io::Result<()> {
+        self.uring.admission.check()
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -547,11 +644,11 @@ impl Handle {
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
     pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> RegisterResult {
         let mut ctx = self.uring.context.lock();
-        let operation = Lifecycle::Submitted;
+        let operation = Operation::Builtin(Lifecycle::Submitted);
         // SAFETY: entry is valid for the entire duration of the operation
         let result = match unsafe { ctx.push(entry, operation) } {
             Ok(index) => {
-                ctx.ops[index] = Lifecycle::Waiting(waker);
+                ctx.ops[index] = Operation::Builtin(Lifecycle::Waiting(waker));
                 match ctx.admission.check() {
                     Ok(()) => RegisterResult::Submitted(index),
                     Err(error) => RegisterResult::Pushed { index, error },
@@ -568,12 +665,13 @@ impl Handle {
         let mut replacement = None;
         loop {
             let mut ctx = self.uring.context.lock();
-            let Some(lifecycle) = ctx.ops.get_mut(index) else {
+            let Some(Operation::Builtin(lifecycle)) = ctx.ops.get_mut(index) else {
                 panic!("Lifecycle must be present");
             };
             match lifecycle {
                 Lifecycle::Completed(_) if replacement.is_none() => {
-                    let Lifecycle::Completed(cqe) = ctx.ops.remove(index) else {
+                    let Operation::Builtin(Lifecycle::Completed(cqe)) = ctx.ops.remove(index)
+                    else {
                         unreachable!()
                     };
                     return Poll::Ready(cqe);
@@ -604,7 +702,7 @@ impl Handle {
     pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
         let cancel_data = data.expect("Data should be present").cancel();
         let mut ctx = self.uring.context.lock();
-        let Some(lifecycle) = ctx.ops.get_mut(index) else {
+        let Some(Operation::Builtin(lifecycle)) = ctx.ops.get_mut(index) else {
             panic!("Lifecycle must be present");
         };
 
@@ -618,7 +716,7 @@ impl Handle {
             }
             // The driver saw the completion, but it was never polled.
             Lifecycle::Completed(cqe) => {
-                let Lifecycle::Cancelled(data) = ctx.ops.remove(index) else {
+                let Operation::Builtin(Lifecycle::Cancelled(data)) = ctx.ops.remove(index) else {
                     unreachable!()
                 };
                 drop(ctx);

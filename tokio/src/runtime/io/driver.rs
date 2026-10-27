@@ -4,8 +4,7 @@ cfg_signal_internal_and_unix! {
 }
 cfg_io_uring! {
     mod uring;
-    use uring::UringShared;
-    pub(crate) use uring::RegisterResult;
+    pub(crate) use uring::{RegisterResult, UringContext, UringShared};
     type IoWaker = Arc<mio::Waker>;
 }
 
