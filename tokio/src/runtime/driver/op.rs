@@ -6,7 +6,7 @@ use crate::io::uring::utils::ArcFd;
 use crate::io::uring::write::Write;
 
 use crate::runtime::io::RegisterResult;
-use crate::runtime::Handle;
+use crate::runtime::{context, Handle};
 
 #[cfg(
     // libc::statx is only supported on these platforms
@@ -25,10 +25,9 @@ use io_uring::cqueue;
 use io_uring::squeue::Entry;
 use std::future::Future;
 use std::io;
-use std::mem;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{ready, Context, Poll, Waker};
 
 // This field isn't accessed directly, but it holds cancellation data,
 // so `#[allow(dead_code)]` is needed.
@@ -179,10 +178,16 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
                 let driver = this.handle.inner.driver().io();
                 // SAFETY: entry is valid for the entire duration of the operation
-                let result = unsafe { driver.register_op(entry, waker) };
+                let result = unsafe { driver.register_op(entry.clone(), waker) };
 
                 match result {
                     RegisterResult::Submitted(idx) => this.state = State::Polled(idx),
+
+                    // Publication can't dispatch completions to make room. Yield and retry.
+                    RegisterResult::NotPushed(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        *entry_opt = Some(entry);
+                        context::defer(cx.waker());
+                    }
 
                     // The kernel never saw the entry, so the resources go back to
                     // the caller with the error.
@@ -216,44 +221,14 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
             State::Polled(idx) => {
                 let driver = this.handle.inner.driver().io();
-                let mut ctx = driver.get_uring().lock();
-                let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
+                let cqe = ready!(driver.poll_op(*idx, cx.waker()));
 
-                match mem::replace(lifecycle, Lifecycle::Submitted) {
-                    // Only replace the stored waker if it wouldn't wake the new one
-                    Lifecycle::Waiting(prev) if !prev.will_wake(cx.waker()) => {
-                        let waker = cx.waker().clone();
-                        *lifecycle = Lifecycle::Waiting(waker);
-                        Poll::Pending
-                    }
+                this.state = State::Complete;
 
-                    Lifecycle::Waiting(prev) => {
-                        *lifecycle = Lifecycle::Waiting(prev);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Completed(cqe) => {
-                        // Clean up and complete the future
-                        ctx.remove_op(*idx);
-
-                        this.state = State::Complete;
-
-                        drop(ctx);
-
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on completion");
-                        Poll::Ready(data.complete(cqe.into()))
-                    }
-
-                    Lifecycle::Submitted => {
-                        unreachable!("Submitted lifecycle should never be seen here");
-                    }
-
-                    Lifecycle::Cancelled(_) => {
-                        unreachable!("Cancelled lifecycle should never be seen here");
-                    }
-                }
+                let data = this
+                    .take_data()
+                    .expect("Data must be present on completion");
+                Poll::Ready(data.complete(cqe.into()))
             }
 
             State::Complete => {

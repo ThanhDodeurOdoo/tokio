@@ -403,14 +403,9 @@ impl Builder {
         ))]
         self.enable_io();
 
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux",
-        ))]
-        self.enable_io_uring();
+        cfg_io_uring!({
+            self.enable_io_uring();
+        });
 
         #[cfg(feature = "time")]
         self.enable_time();

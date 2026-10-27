@@ -748,6 +748,16 @@ macro_rules! cfg_metrics_variant {
 }
 
 macro_rules! cfg_io_uring {
+    ($block:block) => {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring",
+            feature = "rt",
+            feature = "fs",
+            target_os = "linux",
+        ))]
+        $block
+    };
     ($($item:item)*) => {
         $(
             #[cfg(all(
@@ -757,6 +767,21 @@ macro_rules! cfg_io_uring {
                 feature = "fs",
                 target_os = "linux",
             ))]
+            $item
+        )*
+    };
+}
+
+macro_rules! cfg_not_io_uring {
+    ($($item:item)*) => {
+        $(
+            #[cfg(not(all(
+                tokio_unstable,
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux",
+            )))]
             $item
         )*
     };

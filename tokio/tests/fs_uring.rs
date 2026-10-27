@@ -135,7 +135,8 @@ async fn shutdown_retries_interrupted_wait() {
         return;
     };
     let mut probe = io_uring::Probe::new();
-    if ring.submitter().register_probe(&mut probe).is_err()
+    if !ring.params().is_feature_nodrop()
+        || ring.submitter().register_probe(&mut probe).is_err()
         || !probe.is_supported(io_uring::opcode::OpenAt::CODE)
     {
         return;
@@ -246,47 +247,60 @@ async fn cancel_op_future() {
 #[cfg(panic = "unwind")]
 #[test]
 fn completion_waker_panic_preserves_uring() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use io_uring::{opcode, IoUring, Probe};
+    use std::panic::{catch_unwind, resume_unwind};
     use std::sync::Arc;
     use std::task::{Context, Wake, Waker};
+    use tokio::fs::File;
 
-    struct PanicWaker;
+    struct PanicWaker(tokio::sync::mpsc::UnboundedSender<()>);
     impl Wake for PanicWaker {
         fn wake(self: Arc<Self>) {
+            self.0.send(()).unwrap();
             panic!("completion waker panic");
         }
     }
-
-    if io_uring::IoUring::new(2).is_err() {
+    // The blocking fallback also catches waker panics, so it cannot test this path.
+    let Ok(ring) = IoUring::new(2) else {
+        return;
+    };
+    let mut probe = Probe::new();
+    if !ring.params().is_feature_nodrop()
+        || ring.submitter().register_probe(&mut probe).is_err()
+        || !probe.is_supported(opcode::OpenAt::CODE)
+    {
         return;
     }
-
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-
-    // Initialize io_uring on the runtime.
-    rt.block_on(tokio::fs::File::open("/dev/null")).unwrap();
-
-    let mut open_fut = Box::pin(tokio::fs::File::open("/dev/null"));
-    {
-        let _enter = rt.enter();
-        let waker = Waker::from(Arc::new(PanicWaker));
-        let mut cx = Context::from_waker(&waker);
-        tokio_test::assert_pending!(open_fut.as_mut().poll_unpin(&mut cx));
-    }
-
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        rt.block_on(std::future::pending::<()>());
-    }));
-    assert!(res.is_err());
-
-    // The completed operation recorded its CQE before waking, and the ring is still intact.
-    {
-        let _enter = rt.enter();
-        open_fut.now_or_never().unwrap().unwrap();
-
-        let mut next_open = Box::pin(tokio::fs::File::open("/dev/null"));
-        let mut cx = Context::from_waker(Waker::noop());
-        tokio_test::assert_pending!(next_open.as_mut().poll_unpin(&mut cx));
+    drop(ring);
+    let (done, completed) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = catch_unwind(|| {
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(tokio::fs::File::open("/dev/null")).unwrap();
+            let (panicked, mut notified) = tokio::sync::mpsc::unbounded_channel();
+            let mut open_fut = Box::pin(File::open("/dev/null"));
+            {
+                let _enter = rt.enter();
+                let waker = Waker::from(Arc::new(PanicWaker(panicked)));
+                let mut cx = Context::from_waker(&waker);
+                tokio_test::assert_pending!(open_fut.as_mut().poll_unpin(&mut cx));
+            }
+            rt.block_on(async {
+                notified.recv().await.unwrap();
+                open_fut.await.unwrap();
+                File::open("/dev/null").await.unwrap();
+            });
+            rt.block_on(File::open("/dev/null")).unwrap();
+            drop(rt);
+        });
+        let _ = done.send(result);
+    });
+    let result = completed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("completion waker panic stalled the runtime");
+    worker.join().unwrap();
+    if let Err(payload) = result {
+        resume_unwind(payload);
     }
 }
 

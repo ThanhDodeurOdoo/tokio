@@ -4,9 +4,14 @@ cfg_signal_internal_and_unix! {
 }
 cfg_io_uring! {
     mod uring;
-    use uring::UringContext;
+    use uring::UringShared;
     pub(crate) use uring::RegisterResult;
-    use std::sync::OnceLock;
+    type IoWaker = Arc<mio::Waker>;
+}
+
+cfg_not_io_uring! {
+    #[cfg(not(target_os = "wasi"))]
+    type IoWaker = mio::Waker;
 }
 
 use crate::io::interest::Interest;
@@ -52,7 +57,7 @@ pub(crate) struct Handle {
     /// Used to wake up the reactor from a call to `turn`.
     /// Not supported on `Wasi` due to lack of threading support.
     #[cfg(not(target_os = "wasi"))]
-    waker: mio::Waker,
+    waker: IoWaker,
 
     pub(crate) metrics: IoDriverMetrics,
 
@@ -63,16 +68,7 @@ pub(crate) struct Handle {
         feature = "fs",
         target_os = "linux",
     ))]
-    pub(crate) uring_context: Mutex<UringContext>,
-
-    #[cfg(all(
-        tokio_unstable,
-        feature = "io-uring",
-        feature = "rt",
-        feature = "fs",
-        target_os = "linux",
-    ))]
-    pub(crate) uring_probe: OnceLock<Option<io_uring::Probe>>,
+    pub(crate) uring: Arc<UringShared>,
 }
 
 #[derive(Debug)]
@@ -123,6 +119,17 @@ impl Driver {
         let poll = mio::Poll::new()?;
         #[cfg(not(target_os = "wasi"))]
         let waker = mio::Waker::new(poll.registry(), TOKEN_WAKEUP)?;
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring",
+            feature = "rt",
+            feature = "fs",
+            target_os = "linux",
+        ))]
+        let (waker, uring) = {
+            let waker = Arc::new(waker);
+            (waker.clone(), Arc::new(UringShared::new(waker)))
+        };
         let registry = poll.registry().try_clone()?;
 
         let driver = Driver {
@@ -148,15 +155,7 @@ impl Driver {
                 feature = "fs",
                 target_os = "linux",
             ))]
-            uring_context: Mutex::new(UringContext::new()),
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring",
-                feature = "rt",
-                feature = "fs",
-                target_os = "linux",
-            ))]
-            uring_probe: OnceLock::new(),
+            uring,
         };
 
         Ok((driver, handle))
@@ -229,30 +228,9 @@ impl Driver {
             }
         }
 
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux",
-        ))]
-        {
-            let mut guard = handle.get_uring().lock();
-            let ctx = &mut *guard;
-            ctx.dispatch_completions();
-
-            // There might be some cases where the CQ overflows, so we need to flush
-            // the remaining buffered CQEs.
-            while ctx
-                .uring
-                .as_mut()
-                .is_some_and(|uring| uring.submission().cq_overflow())
-            {
-                ctx.submit()
-                    .expect("failed to flush io_uring completion queue overflow");
-                ctx.dispatch_completions();
-            }
-        }
+        cfg_io_uring!({
+            handle.dispatch_completions();
+        });
 
         handle.metrics.incr_ready_count_by(ready_count);
     }
