@@ -20,7 +20,7 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new().read(true).open(path).await?;
 
     #[cfg(not(any(target_env = "gnu", target_os = "android")))]
-    let size_hint: Option<usize> = file.metadata().await.map(|m| m.len() as usize).ok();
+    let size_hint = file.metadata().await.map(|m| m.len() as usize);
 
     #[cfg(
         // libc::statx is only supported on these platforms
@@ -34,19 +34,17 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
         // https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/
         any(target_env = "gnu", target_os = "android")
     )]
-    let size_hint = Op::file_metadata(&file)?
-        .await
-        .map(|m| m.len() as usize)
-        .ok();
+    let size_hint = Op::file_metadata(&file)?.await.map(|m| m.len() as usize);
 
-    let fd: OwnedFd = file
-        .try_into_std()
-        .expect("unexpected in-flight operation detected")
-        .into();
+    let fd: OwnedFd = match file.try_into_std() {
+        Ok(file) => file.into(),
+        // A failed submission can return before Statx releases the descriptor.
+        Err(_) => return Err(size_hint.expect_err("successful metadata must release the file")),
+    };
 
     let mut buf = Vec::new();
 
-    if let Some(size_hint) = size_hint {
+    if let Ok(size_hint) = size_hint {
         buf.try_reserve(size_hint)?;
     }
 

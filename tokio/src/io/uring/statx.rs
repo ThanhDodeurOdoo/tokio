@@ -16,7 +16,7 @@
 ))]
 
 use crate::fs::File;
-use crate::io::uring::utils::cstr;
+use crate::io::uring::utils::{cstr, ArcFd};
 use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult, Op};
 use io_uring::{opcode, types};
 use libc::statx;
@@ -24,7 +24,6 @@ use std::ffi::{CStr, CString};
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 
 pub(crate) struct Metadata(statx);
@@ -44,12 +43,22 @@ impl Debug for Metadata {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct Statx {
     /// This field will be read by the kernel during the operation, so we
     /// need to ensure it is valid for the entire duration of the operation.
     _path: CString,
-    buffer: Box<MaybeUninit<statx>>,
+    _fd: Option<ArcFd>,
+    // Vec::as_mut_ptr stays valid when the Vec moves. A pointer taken through
+    // a Box would not under Rust's aliasing rules.
+    buffer: Vec<MaybeUninit<statx>>,
+}
+
+impl Debug for Statx {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statx")
+            .field("_path", &self._path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Completable for Statx {
@@ -62,7 +71,7 @@ impl Completable for Statx {
         // Refer to man page description and return value:
         // https://man7.org/linux/man-pages/man2/statx.2.html
         cqe.result
-            .map(|_| Metadata(unsafe { *self.buffer.as_ptr() }))
+            .map(|_| Metadata(unsafe { self.buffer[0].assume_init_read() }))
     }
 
     fn complete_with_error(self, error: io::Error) -> Self::Output {
@@ -85,7 +94,7 @@ impl Op<Statx> {
     #[inline]
     fn statx(path: &Path, flags: i32) -> io::Result<Op<Statx>> {
         let path = cstr(path)?;
-        let mut buffer = Box::new(MaybeUninit::<statx>::uninit());
+        let mut buffer = vec![MaybeUninit::<statx>::uninit()];
 
         let statx_op = opcode::Statx::new(
             types::Fd(libc::AT_FDCWD),
@@ -102,6 +111,7 @@ impl Op<Statx> {
                 statx_op,
                 Statx {
                     _path: path,
+                    _fd: None,
                     buffer,
                 },
             )
@@ -117,7 +127,8 @@ impl Op<Statx> {
 
     /// Retrieves the metadata information of the given file
     pub(crate) fn file_metadata(file: &File) -> io::Result<Op<Statx>> {
-        let mut buffer = Box::new(MaybeUninit::<statx>::uninit());
+        let fd = file.uring_fd();
+        let mut buffer = vec![MaybeUninit::<statx>::uninit()];
         let empty_path: &'static CStr = c"";
 
         // io-uring was introduced in linux 5.1
@@ -125,7 +136,7 @@ impl Op<Statx> {
         // status as specified by man:
         // https://man7.org/linux/man-pages/man2/statx.2.html
         let statx_op = opcode::Statx::new(
-            types::Fd(file.as_raw_fd()),
+            types::Fd(fd.as_raw_fd()),
             // it should be fine to pass in `empty_path` whose lifetime
             // does not exceed the `file_metadata()` function as a ptr here
             // because we want to stat the dirfd not this pathname
@@ -136,12 +147,13 @@ impl Op<Statx> {
         .mask(libc::STATX_BASIC_STATS | libc::STATX_BTIME)
         .build();
 
-        // SAFETY: Parameters are valid for the entire duration of the operation
+        // SAFETY: Statx keeps the fd and output buffer alive until the operation completes.
         Ok(unsafe {
             Op::new(
                 statx_op,
                 Statx {
                     _path: empty_path.into(),
+                    _fd: Some(fd),
                     buffer,
                 },
             )
