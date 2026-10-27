@@ -267,6 +267,7 @@ fn completion_waker_panic_preserves_uring() {
     use std::sync::Arc;
     use std::task::{Context, Wake, Waker};
     use tokio::fs::File;
+    use tokio::io::uring::Uring;
 
     struct PanicWaker(tokio::sync::mpsc::UnboundedSender<()>);
     impl Wake for PanicWaker {
@@ -291,7 +292,7 @@ fn completion_waker_panic_preserves_uring() {
     let worker = std::thread::spawn(move || {
         let result = catch_unwind(|| {
             let rt = Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(tokio::fs::File::open("/dev/null")).unwrap();
+            Uring::new(rt.handle()).unwrap();
             let (panicked, mut notified) = tokio::sync::mpsc::unbounded_channel();
             let mut open_fut = Box::pin(File::open("/dev/null"));
             {
