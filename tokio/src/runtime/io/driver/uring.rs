@@ -1,18 +1,31 @@
-use io_uring::{squeue::Entry, IoUring, Probe};
+use crate::io::uring::{CompletionAction, OperationId, Submission};
+use crate::io::Interest;
+use crate::loom::sync::atomic::{AtomicU32, Ordering};
+use crate::loom::sync::{Arc, Mutex, MutexGuard};
+use crate::runtime::driver::op::{CancelData, Cancellable, CqeResult, Lifecycle};
+use crate::runtime::{context, scheduler};
+use io_uring::{cqueue, opcode, squeue::Entry, IoUring, Probe};
 use mio::unix::SourceFd;
 use slab::Slab;
-
-use crate::runtime::driver::op::CancelData;
-use crate::runtime::driver::op::CqeResult;
-use crate::runtime::driver::op::{Cancellable, Lifecycle};
-use crate::{io::Interest, loom::sync::Mutex};
+use std::any::Any;
+use std::io;
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
+use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use super::{Handle, TOKEN_WAKEUP};
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::{io, mem, task::Waker};
-
 const DEFAULT_RING_SIZE: u32 = 256;
+// Bound all CQEs, including cancel replies, so refill loops can't starve tasks.
+const COMPLETION_BATCH_SIZE: usize = 32;
+const SHUTDOWN_POLL_TIMEOUT_MS: libc::c_int = 100;
+const SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(1);
+const CANCEL_USER_DATA: u64 = u64::MAX;
+const SHUTDOWN_BIT: u32 = 1 << 31;
+const ERROR_MASK: u32 = SHUTDOWN_BIT - 1;
 
 /// Outcome of registering an op with the io_uring.
 pub(crate) enum RegisterResult {
@@ -27,182 +40,388 @@ pub(crate) enum RegisterResult {
     Pushed { index: usize, error: io::Error },
 }
 
+pub(crate) struct UringShared {
+    context: Mutex<UringContext>,
+    waker: Arc<mio::Waker>,
+    admission: Arc<UringAdmission>,
+    probe: OnceLock<Option<Probe>>,
+}
+
+impl UringShared {
+    pub(super) fn new(waker: Arc<mio::Waker>) -> Self {
+        let admission = Arc::new(UringAdmission::new());
+        Self {
+            context: Mutex::new(UringContext::new(admission.clone())),
+            waker,
+            admission,
+            probe: OnceLock::new(),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must respect `Uring::submit`'s safety requirements.
+    pub(crate) unsafe fn submit(
+        &self,
+        entry: Entry,
+        callback: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+        state: *mut (),
+    ) -> io::Result<OperationId> {
+        let mut context = self.context.lock();
+        // SAFETY: caller guarantees SQE ressources and callback state lifetimes.
+        let result = unsafe { context.publish(entry, callback, state) };
+        self.unlock(context);
+        result
+    }
+
+    fn unlock(&self, mut context: MutexGuard<'_, UringContext>) {
+        let needs_flush = context.needs_flush();
+        drop(context);
+        if needs_flush {
+            // A failed wake can't undo accepted requests, so it must not turn
+            // their Ok results into errors.
+            let _ = self.waker.wake();
+        }
+    }
+}
+
+fn closed() -> io::Error {
+    io::Error::other(crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR)
+}
+
+struct UringAdmission {
+    state: AtomicU32,
+}
+
+impl UringAdmission {
+    fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+        }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        let state = self.state.load(Ordering::Acquire);
+        if state & SHUTDOWN_BIT != 0 {
+            Err(closed())
+        } else if state != 0 {
+            Err(io::Error::from_raw_os_error(state as i32))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & ERROR_MASK != 0
+    }
+
+    fn close(&self) {
+        self.state.fetch_or(SHUTDOWN_BIT, Ordering::Release);
+    }
+
+    fn record_result(&self, result: io::Result<usize>) {
+        if let Err(error) = result {
+            match error.raw_os_error() {
+                // ENOMEM can be transient during kernel setup for this thread.
+                Some(libc::EINTR | libc::EBUSY | libc::EAGAIN | libc::ENOMEM) => {}
+                error => {
+                    self.fail(error.unwrap_or(libc::EIO));
+                }
+            }
+        }
+    }
+
+    fn fail(&self, error: i32) {
+        debug_assert!(error > 0);
+        // Writers have exclusive access to the context.
+        let state = self.state.load(Ordering::Relaxed);
+        if state & ERROR_MASK == 0 {
+            self.state.store(state | error as u32, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Callback {
+    function: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+    state: *mut (),
+}
+
+// SAFETY: submit requires callback state to be usable from the driver thread.
+unsafe impl Send for Callback {}
+
+enum Operation {
+    Builtin(Lifecycle),
+    Custom(Callback),
+}
+
+impl Operation {
+    fn awaits_cqe(&self) -> bool {
+        !matches!(self, Operation::Builtin(Lifecycle::Completed(_)))
+    }
+}
+
+fn release_cancelled(data: CancelData, cqe: cqueue::Entry) {
+    let _fd = match (&data, CqeResult::from(cqe).result) {
+        // SAFETY: this successful Open CQE yields a new file descriptor.
+        (CancelData::Open(_), Ok(fd)) => Some(unsafe { OwnedFd::from_raw_fd(fd as i32) }),
+        _ => None,
+    };
+    drop(data);
+}
+
+struct CompletionBatch {
+    entries: [Option<(Callback, cqueue::Entry)>; COMPLETION_BATCH_SIZE],
+    cancelled: [Option<(CancelData, cqueue::Entry)>; COMPLETION_BATCH_SIZE],
+    panics: [Option<Box<dyn Any + Send>>; COMPLETION_BATCH_SIZE],
+    wakers: Vec<Waker>,
+    consumed: usize,
+}
+
+impl CompletionBatch {
+    fn new() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| None),
+            cancelled: std::array::from_fn(|_| None),
+            panics: std::array::from_fn(|_| None),
+            wakers: Vec::new(),
+            consumed: 0,
+        }
+    }
+
+    fn run(&mut self, ctx: &mut UringContext) {
+        for (index, entry) in self.entries[..self.consumed].iter_mut().enumerate() {
+            let Some((callback, cqe)) = entry else {
+                continue;
+            };
+            let mut action = if cqueue::more(cqe.flags()) {
+                CompletionAction::Keep
+            } else {
+                CompletionAction::Remove
+            };
+            // todo
+            let mut submission = Submission {
+                context: ctx,
+                wakers: &mut self.wakers,
+            };
+            // Payload destructors may submit too. so keep until after unlock.
+            self.panics[index] = catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: submit's caller keeps this state valid until this CQE is handled.
+                action =
+                    unsafe { (callback.function)(&mut submission, cqe.clone(), callback.state) };
+            }))
+            .err();
+            if action == CompletionAction::Keep {
+                *entry = None;
+            }
+        }
+        for (_, cqe) in self.entries[..self.consumed].iter().flatten() {
+            ctx.ops.remove(cqe.user_data() as usize);
+        }
+    }
+
+    // Runs after unlocking. One panic must not skip later cleanup or task wakes.
+    fn finish(mut self) -> bool {
+        let mut panicked = false;
+        for cancelled in &mut self.cancelled[..self.consumed] {
+            if let Some((data, cqe)) = cancelled.take() {
+                panicked |= catch_panic(|| release_cancelled(data, cqe));
+            }
+        }
+        for waker in self.wakers.drain(..) {
+            // ffffff
+            panicked |= catch_panic(|| waker.wake());
+        }
+        for payload in &mut self.panics[..self.consumed] {
+            if let Some(payload) = payload.take() {
+                panicked = true;
+                drop_panic(payload);
+            }
+        }
+        !panicked
+    }
+}
+
+fn catch_panic(f: impl FnOnce()) -> bool {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(()) => false,
+        Err(payload) => {
+            drop_panic(payload);
+            true
+        }
+    }
+}
+
+fn drop_panic(payload: Box<dyn Any + Send>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(payload);
+    }
+}
+
 pub(crate) struct UringContext {
-    pub(crate) uring: Option<io_uring::IoUring>,
-    pub(crate) ops: slab::Slab<Lifecycle>,
+    uring: Option<IoUring>,
+    ops: Slab<Operation>,
+    admission: Arc<UringAdmission>,
+}
+
+impl Drop for UringContext {
+    fn drop(&mut self) {
+        for operation in self.ops.drain() {
+            if let Operation::Builtin(Lifecycle::Cancelled(data)) = operation {
+                // Without a terminal CQE, the kernel may still use this data.
+                mem::forget(data);
+            }
+        }
+    }
 }
 
 impl UringContext {
-    pub(crate) fn new() -> Self {
+    fn new(admission: Arc<UringAdmission>) -> Self {
         Self {
-            ops: Slab::new(),
             uring: None,
+            ops: Slab::new(),
+            admission,
         }
     }
 
-    pub(crate) fn ring(&self) -> &io_uring::IoUring {
+    fn ring(&self) -> &IoUring {
         self.uring.as_ref().expect("io_uring not initialized")
     }
 
-    pub(crate) fn ring_mut(&mut self) -> &mut io_uring::IoUring {
+    fn ring_mut(&mut self) -> &mut IoUring {
         self.uring.as_mut().expect("io_uring not initialized")
     }
 
-    /// Perform `io_uring_setup` system call, and Returns true if this
-    /// actually initialized the io_uring.
-    ///
-    /// If the machine doesn't support io_uring, then this will return an
-    /// `ENOSYS` error.
-    pub(crate) fn try_init(&mut self, probe: &mut Probe) -> io::Result<bool> {
-        if self.uring.is_some() {
-            // Already initialized.
-            return Ok(false);
+    // Immediate submission for now. Batching: https://github.com/tokio-rs/tokio/pull/7761.
+    fn flush(&mut self) {
+        if !self.needs_flush() {
+            return;
         }
-
-        let uring = IoUring::new(DEFAULT_RING_SIZE)?;
-
-        match uring.submitter().register_probe(probe) {
-            Ok(_) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                // The kernel does not support IORING_REGISTER_PROBE.
-                return Err(io::Error::from_raw_os_error(libc::ENOSYS));
-            }
-            Err(e) => return Err(e),
-        }
-
-        self.uring.replace(uring);
-
-        Ok(true)
+        let result = self.ring().submit();
+        self.admission.record_result(result);
+        self.check_cq_loss();
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
-        let ops = &mut self.ops;
-        let Some(uring) = self.uring.as_mut() else {
-            // Uring is not initialized yet.
+    fn check_cq_loss(&mut self) {
+        let Some(ring) = &mut self.uring else {
             return;
         };
+        let dropped = ring.completion().overflow();
+        if dropped != 0 {
+            // Older kernels may only report CQE loss here, without EBADR.
+            self.admission.fail(libc::EBADR);
+        }
+    }
 
-        let cq = uring.completion();
+    fn needs_flush(&mut self) -> bool {
+        self.check_cq_loss();
+        if self.admission.failed() {
+            // Another enter could submit rejected SQEs whose resources were freed.
+            return false;
+        }
+        let Some(ring) = &mut self.uring else {
+            return false;
+        };
+        let sq = ring.submission();
+        !sq.is_empty() || sq.cq_overflow()
+    }
 
-        for cqe in cq {
-            let idx = cqe.user_data() as usize;
+    pub(crate) unsafe fn publish(
+        &mut self,
+        entry: Entry,
+        function: unsafe fn(&mut Submission<'_>, cqueue::Entry, *mut ()) -> CompletionAction,
+        state: *mut (),
+    ) -> io::Result<OperationId> {
+        let operation = Operation::Custom(Callback { function, state });
+        // SAFETY: the caller guarantees the entry and callback lifetimes.
+        let index = unsafe { self.push(entry, operation) }?;
+        Ok(OperationId(index as u64))
+    }
 
-            match ops.get_mut(idx) {
-                Some(lifecycle @ Lifecycle::Waiting(_)) => {
+    /// # Safety
+    ///
+    /// The entry's resources must stay valid until its terminal CQE.
+    /// A rejected `operation` drops under the lock, so it must own nothing.
+    unsafe fn push(&mut self, entry: Entry, operation: Operation) -> io::Result<usize> {
+        self.admission.check()?;
+        if self.ring_mut().submission().is_full() {
+            self.flush();
+            self.admission.check()?;
+            if self.ring_mut().submission().is_full() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        }
+        let index = self.ops.insert(operation);
+        let entry = entry.user_data(index as u64);
+        // SAFETY: the caller guarantees the entry and callback lifetimes.
+        unsafe { self.ring_mut().submission().push(&entry) }
+            .expect("submission queue capacity checked under the ring lock");
+        self.flush();
+        if let Err(error) = self.admission.check() {
+            // Without SQPOLL, a nonempty refreshed SQ proves this newest SQE wasn't
+            // consumed. Failed rings never enter again, so rejecting it is safe.
+            // Earlier accepted entries have no such proof.
+            if !self.ring_mut().submission().is_empty() {
+                self.ops.remove(index);
+                return Err(error);
+            }
+        }
+        Ok(index)
+    }
+
+    fn completions(&mut self, limit: usize) -> CompletionBatch {
+        self.check_cq_loss();
+        let mut batch = CompletionBatch::new();
+        let Some(ring) = &mut self.uring else {
+            return batch;
+        };
+        let mut cq = ring.completion();
+        let slots = batch.entries.iter_mut().zip(&mut batch.cancelled);
+        for (entry, cancelled) in slots.take(limit) {
+            let Some(cqe) = cq.next() else {
+                break;
+            };
+            batch.consumed += 1;
+            if cqe.user_data() == CANCEL_USER_DATA {
+                continue;
+            }
+            let index = cqe.user_data() as usize;
+            match self.ops.get_mut(index) {
+                Some(Operation::Custom(callback)) => *entry = Some((*callback, cqe)),
+                Some(Operation::Builtin(lifecycle @ Lifecycle::Waiting(_))) => {
                     let Lifecycle::Waiting(waker) =
                         mem::replace(lifecycle, Lifecycle::Completed(cqe))
                     else {
                         unreachable!()
                     };
-                    waker.wake_by_ref();
+                    batch.wakers.push(waker);
                 }
-                Some(Lifecycle::Cancelled(cancel_data)) => {
-                    if let CancelData::Open(_) = cancel_data {
-                        if let Ok(fd) = CqeResult::from(cqe).result {
-                            // SAFETY: the successful CQE result provides
-                            // a non-negative integer, and the event is
-                            // related to an open operation.
-                            unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                        }
-                    }
-                    // Op future was cancelled, so we discard the result.
-                    ops.remove(idx);
+                Some(Operation::Builtin(Lifecycle::Cancelled(_))) => {
+                    let Operation::Builtin(Lifecycle::Cancelled(data)) = self.ops.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    *cancelled = Some((data, cqe));
                 }
-                Some(other) => {
-                    panic!("unexpected lifecycle for slot {idx}: {other:?}");
-                }
-                None => {
-                    panic!("no op at index {idx}");
+                _ => {
+                    // Keep the valid completions already collected when a CQE can't be routed.
+                    self.admission.fail(libc::EIO);
+                    break;
                 }
             }
         }
-
-        // `cq`'s drop gets called here, updating the latest head pointer
+        batch
     }
 
-    pub(crate) fn submit(&mut self) -> io::Result<()> {
-        loop {
-            // Errors from io_uring_enter: https://man7.org/linux/man-pages/man2/io_uring_enter.2.html#ERRORS
-            match self.ring().submit() {
-                Ok(_) => {
-                    if self.ring_mut().submission().is_empty() {
-                        return Ok(());
-                    }
-                }
-
-                // If the submission queue is full, we dispatch completions and try again.
-                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions();
-                }
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {}
-                // For other errors, we currently return the error as is.
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
+    fn awaits_cqes(&self) -> bool {
+        self.ops.iter().any(|(_, operation)| operation.awaits_cqe())
     }
 
-    pub(crate) fn remove_op(&mut self, index: usize) -> Lifecycle {
-        self.ops.remove(index)
-    }
-}
-
-/// Drop the driver, cancelling any in-progress ops and waiting for them to terminate.
-impl Drop for UringContext {
-    fn drop(&mut self) {
-        if self.uring.is_none() {
-            // Uring is not initialized or not supported.
-            return;
-        }
-
-        // Make sure we flush the submission queue before dropping the driver.
-        if !self.ring_mut().submission().is_empty() {
-            if let Err(error) = self.submit() {
-                // The kernel may still be using resources from previously submitted operations.
-                mem::forget(mem::take(&mut self.ops));
-                panic!("Internal error when dropping driver: {error:?}");
-            }
-        }
-
-        let mut ops = std::mem::take(&mut self.ops);
-
-        // Remove all completed ops since we don't need to wait for them.
-        ops.retain(|_, lifecycle| !matches!(lifecycle, Lifecycle::Completed(_)));
-
-        while !ops.is_empty() {
-            // Wait until at least one completion is available.
-            match self.ring_mut().submit_and_wait(1) {
-                Ok(_) => {}
-                // A failed wait can still leave completions available. Drain them below
-                // before retrying, retaining resources for operations that remain pending.
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EINTR | libc::EBUSY | libc::EAGAIN)
-                    ) => {}
-                Err(error) => {
-                    // The kernel may still be using the resources held by pending operations.
-                    mem::forget(ops);
-                    panic!("Internal error when dropping driver: {error:?}");
-                }
-            }
-
-            for cqe in self.ring_mut().completion() {
-                let idx = cqe.user_data() as usize;
-
-                if let Some(Lifecycle::Cancelled(CancelData::Open(_))) = ops.get_mut(idx) {
-                    if let Ok(fd) = CqeResult::from(cqe).result {
-                        // SAFETY: the successful CQE result provides
-                        // a non-negative integer, and the event is
-                        // related to an open operation.
-                        unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                    }
-                };
-
-                ops.remove(idx);
-            }
-        }
+    fn needs_turn(&mut self) -> bool {
+        self.uring
+            .as_mut()
+            .is_some_and(|ring| !ring.completion().is_empty())
+            || self.needs_flush()
     }
 }
 
@@ -213,161 +432,312 @@ impl Handle {
             .register(&mut source, TOKEN_WAKEUP, Interest::READABLE.to_mio())
     }
 
-    pub(crate) fn get_uring(&self) -> &Mutex<UringContext> {
-        &self.uring_context
+    pub(super) fn dispatch_completions(&self) {
+        if self.uring.probe.get().and_then(Option::as_ref).is_none() {
+            return;
+        }
+        let mut batch;
+        let needs_turn = {
+            let mut ctx = self.uring.context.lock();
+            batch = ctx.completions(COMPLETION_BATCH_SIZE);
+            ctx.flush();
+            batch.run(&mut ctx);
+            ctx.needs_turn()
+        };
+        if needs_turn {
+            // Remaining CQEs may not produce another I/O notification.
+            let _ = self.waker.wake();
+        }
+        if !batch.finish() {
+            // Apply the task panic policy after cleanup, since shutdown can drop
+            // tasks whose completions are in this batch.
+            catch_panic(|| {
+                context::with_scheduler(|context| {
+                    if let Some(scheduler::Context::CurrentThread(context)) = context {
+                        context.unhandled_io_panic();
+                    }
+                });
+            });
+        }
     }
 
-    /// Returns `true` if io_uring has already been initialized and the given
-    /// opcode is supported. Returns `false` if io_uring hasn't been
-    /// initialized yet or is unsupported. Unlike `check_and_init`, this
-    /// doesn't attempt initialization.
+    pub(super) fn shutdown_uring(&self) {
+        let ids = {
+            let ctx = self.uring.context.lock();
+            // No new registrations may reuse these IDs while shutdown queues cancels.
+            ctx.admission.close();
+            if ctx.uring.is_none() {
+                return;
+            }
+            ctx.ops
+                .iter()
+                .filter(|(_, operation)| operation.awaits_cqe())
+                .map(|(index, _)| index as u64)
+                .collect::<Vec<_>>()
+        };
+        let mut cancels = ids.into_iter().peekable();
+        let mut failed_remaining = None;
+        loop {
+            let mut batch;
+            let made_progress = {
+                let mut ctx = self.uring.context.lock();
+                ctx.check_cq_loss();
+                if ctx.admission.failed() && failed_remaining.is_none() {
+                    // Multishot CQEs can keep arriving after failure disables cancellation.
+                    failed_remaining = Some(ctx.ring_mut().completion().len());
+                }
+                batch = ctx.completions(failed_remaining.unwrap_or(COMPLETION_BATCH_SIZE));
+                if let Some(remaining) = &mut failed_remaining {
+                    *remaining -= batch.consumed;
+                }
+                let queued = ctx.ring_mut().submission().len();
+                ctx.flush();
+                let mut made_progress =
+                    batch.consumed != 0 || ctx.ring_mut().submission().len() < queued;
+                // Submit all targets before their cancels, including SQEs left queued by EINTR.
+                if !ctx.admission.failed() && ctx.ring_mut().submission().is_empty() {
+                    while let Some(&id) = cancels.peek() {
+                        let entry = opcode::AsyncCancel::new(id)
+                            .build()
+                            .user_data(CANCEL_USER_DATA);
+                        // SAFETY: AsyncCancel doesn't point at any memory.
+                        if unsafe { ctx.ring_mut().submission().push(&entry) }.is_err() {
+                            break;
+                        }
+                        cancels.next();
+                        made_progress = true;
+                    }
+                    ctx.flush();
+                }
+                batch.run(&mut ctx);
+                made_progress |= !ctx.ring_mut().completion().is_empty();
+                made_progress
+            };
+            batch.finish();
+            if failed_remaining == Some(0) || !self.uring.context.lock().awaits_cqes() {
+                break;
+            }
+            if failed_remaining.is_some() {
+                continue;
+            }
+            let waited = cancels.peek().is_none() && self.wait_for_uring_completions();
+            if !made_progress && !waited && !self.uring.admission.failed() {
+                std::thread::sleep(SHUTDOWN_RETRY_DELAY);
+            }
+        }
+        self.uring.context.lock().uring = None;
+    }
+
+    fn wait_for_uring_completions(&self) -> bool {
+        let mut ctx = self.uring.context.lock();
+        ctx.check_cq_loss();
+        if ctx.admission.failed() || !ctx.ring_mut().submission().is_empty() {
+            return false;
+        }
+        // Admission is closed, so only shutdown uses the ring while the mutex is released.
+        debug_assert!(ctx.admission.state.load(Ordering::Acquire) & SHUTDOWN_BIT != 0);
+        let mut ring = ctx.uring.take().unwrap();
+        drop(ctx);
+        let result = ring.submit();
+        let result = result.and_then(|submitted| {
+            if ring.completion().overflow() != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADR));
+            }
+            // TODO recheck doc
+            // Older kernels may not wake enter on CQE loss. Timed poll rechecks loss
+            // without EXT_ARG. Nonblocking enter runs task work and drains overflow.
+            let mut fd = libc::pollfd {
+                fd: ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: fd is one initialized pollfd and the ring keeps its fd open.
+            let result = unsafe { libc::poll(&mut fd, 1, SHUTDOWN_POLL_TIMEOUT_MS) };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(submitted)
+            }
+        });
+        let mut ctx = self.uring.context.lock();
+        ctx.uring = Some(ring);
+        let waited = result.is_ok();
+        ctx.admission.record_result(result);
+        ctx.check_cq_loss();
+        waited
+    }
+
+    pub(crate) fn check_uring_admission(&self) -> io::Result<()> {
+        self.uring.admission.check()
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn is_uring_ready(&self, opcode: u8) -> bool {
-        self.uring_probe
-            .get()
-            .and_then(|opt| opt.as_ref())
-            .is_some_and(|probe| probe.is_supported(opcode))
+        self.uring.admission.state.load(Ordering::Acquire) == 0
+            && self
+                .uring
+                .probe
+                .get()
+                .and_then(|opt| opt.as_ref())
+                .is_some_and(|probe| probe.is_supported(opcode))
     }
 
-    /// Returns `true` if the io_uring probe has already been attempted
-    /// (regardless of whether io_uring is supported). Returns `false` if
-    /// no probe has been attempted yet.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn is_uring_probed(&self) -> bool {
-        self.uring_probe.get().is_some()
+        self.uring.probe.get().is_some()
     }
 
-    /// Check if the io_uring context is initialized. If not, it will try to initialize it.
-    /// Then, check if the provided opcode is supported.
-    ///
-    /// If both the context initialization succeeds and the opcode is supported,
-    /// this returns `Ok(true)`.
-    /// If either io_uring is unsupported or the opcode is unsupported,
-    /// this returns `Ok(false)`.
-    /// An error is returned if an io_uring syscall returns an unexpected error value.
-    ///
-    /// TODO: This would like to be a synchronous function,
-    /// but we require `OnceLock::get_or_try_init`.
-    /// <https://github.com/rust-lang/rust/issues/109737>
     pub(crate) async fn check_and_init(&self, opcode: u8) -> io::Result<bool> {
-        let probe = self
-            .uring_probe
-            .get_or_try_init(|| async {
-                let mut probe = Probe::new();
-                match self.try_init(&mut probe) {
-                    Ok(()) => Ok(Some(probe)),
-                    // If the system doesn't support io_uring, we set the probe to `None`.
-                    Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Ok(None),
-                    // If we get EPERM, io-uring syscalls may be blocked (for example, by seccomp).
-                    // In this case, we try to fall back to spawn_blocking for this and future operations.
-                    // See also: https://github.com/tokio-rs/tokio/issues/7691
-                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(None),
-                    // For other system errors, we just return it.
-                    Err(e) => Err(e),
-                }
-            })
-            .await?;
+        self.check_and_init_sync(opcode)
+    }
+
+    /// Unsupported rings/opcodes and failed rings return `Ok(false)`.
+    /// Shutdown returns the runtime shutdown error. Other setup errors pass through.
+    pub(crate) fn check_and_init_sync(&self, opcode: u8) -> io::Result<bool> {
+        let probe = match self.uring.probe.get() {
+            Some(probe) => probe,
+            None => self.init_probe()?,
+        };
+        let state = self.uring.admission.state.load(Ordering::Acquire);
+        if state & SHUTDOWN_BIT != 0 {
+            return Err(closed());
+        }
+        if state & ERROR_MASK != 0 {
+            return Ok(false);
+        }
 
         Ok(probe
             .as_ref()
             .is_some_and(|probe| probe.is_supported(opcode)))
     }
 
-    /// Initialize the io_uring context if it hasn't been initialized yet.
-    fn try_init(&self, probe: &mut Probe) -> io::Result<()> {
-        let mut guard = self.get_uring().lock();
-        if guard.try_init(probe)? {
-            self.add_uring_source(guard.ring().as_raw_fd())?;
+    fn init_probe(&self) -> io::Result<&Option<Probe>> {
+        let mut guard = self.uring.context.lock();
+        if let Some(probe) = self.uring.probe.get() {
+            return Ok(probe);
         }
+        guard.admission.check()?;
+        let mut probe = Probe::new();
+        let probe = match self.try_init(&mut guard, &mut probe) {
+            Ok(()) => Some(probe),
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+            // Cache EPERM for seccomp-restricted hosts: https://github.com/tokio-rs/tokio/issues/7691.
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => None,
+            Err(e) => return Err(e),
+        };
+        // Publish before unlocking so another initializer cannot replace the ring.
+        Ok(self.uring.probe.get_or_init(|| probe))
+    }
 
+    fn try_init(&self, guard: &mut UringContext, probe: &mut Probe) -> io::Result<()> {
+        let uring = IoUring::new(DEFAULT_RING_SIZE)?;
+        // NODROP buffers overflowing CQEs, though allocation failure can still lose them.
+        if !uring.params().is_feature_nodrop() {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        match uring.submitter().register_probe(probe) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            }
+            Err(e) => return Err(e),
+        }
+        self.add_uring_source(uring.as_raw_fd())?;
+        guard.uring = Some(uring);
         Ok(())
     }
 
     /// Register an operation with the io_uring.
-    ///
-    /// If this is the first io_uring operation, it will also initialize the io_uring context.
-    /// If io_uring isn't supported, this function returns an `ENOSYS` error, so the caller can
-    /// perform custom handling, such as falling back to an alternative mechanism.
     ///
     /// # Safety
     ///
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
     pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> RegisterResult {
-        assert!(self.uring_probe.initialized());
-
-        // Uring is initialized.
-
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let index = ctx.ops.insert(Lifecycle::Waiting(waker));
-        let entry = entry.user_data(index as u64);
-
-        // `entry` has not been pushed yet, so a submit error here means it never
-        // reached the kernel and we can drop the slot before returning.
-        let submit_before_push = |ctx: &mut UringContext| -> io::Result<()> {
-            if let Err(e) = ctx.submit() {
-                ctx.remove_op(index);
-                return Err(e);
-            }
-            Ok(())
-        };
-
+        let mut ctx = self.uring.context.lock();
+        let operation = Operation::Builtin(Lifecycle::Submitted);
         // SAFETY: entry is valid for the entire duration of the operation
-        while unsafe { ctx.ring_mut().submission().push(&entry).is_err() } {
-            // If the submission queue is full, flush it to the kernel and retry.
-            if let Err(e) = submit_before_push(ctx) {
-                return RegisterResult::NotPushed(e);
+        let result = match unsafe { ctx.push(entry, operation) } {
+            Ok(index) => {
+                ctx.ops[index] = Operation::Builtin(Lifecycle::Waiting(waker));
+                match ctx.admission.check() {
+                    Ok(()) => RegisterResult::Submitted(index),
+                    Err(error) => RegisterResult::Pushed { index, error },
+                }
+            }
+            Err(error) => RegisterResult::NotPushed(error),
+        };
+        self.uring.unlock(ctx);
+        result
+    }
+
+    pub(crate) fn poll_op(&self, index: usize, waker: &Waker) -> Poll<cqueue::Entry> {
+        // Declared before the guard so a clone always drops unlocked.
+        let mut replacement = None;
+        loop {
+            let mut ctx = self.uring.context.lock();
+            let Some(Operation::Builtin(lifecycle)) = ctx.ops.get_mut(index) else {
+                panic!("Lifecycle must be present");
+            };
+            match lifecycle {
+                Lifecycle::Completed(_) if replacement.is_none() => {
+                    let Operation::Builtin(Lifecycle::Completed(cqe)) = ctx.ops.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    return Poll::Ready(cqe);
+                }
+                Lifecycle::Completed(_) => {}
+                Lifecycle::Waiting(current) if current.will_wake(waker) => return Poll::Pending,
+                Lifecycle::Waiting(current) => {
+                    if let Some(replacement) = replacement.take() {
+                        let previous = mem::replace(current, replacement);
+                        drop(ctx);
+                        drop(previous);
+                        return Poll::Pending;
+                    }
+                }
+                Lifecycle::Submitted | Lifecycle::Cancelled(_) => {
+                    unreachable!("Unexpected lifecycle for a polled op");
+                }
+            }
+            drop(ctx);
+            // Wakers can re-enter or panic. Keep any CQE in the slot while cloning/dropping unlocked.
+            match replacement.take() {
+                Some(stale) => drop(stale),
+                None => replacement = Some(waker.clone()),
             }
         }
-
-        // Ensure that the completion queue is not full before submitting the entry.
-        while ctx.ring_mut().completion().is_full() {
-            ctx.dispatch_completions();
-        }
-
-        // Note: For now, we submit the entry immediately without utilizing batching.
-        //
-        // `entry` is now pushed, so the kernel may already own the buffer it
-        // points at. Keep the slot on a submit error: dropping it would let the
-        // `Op` free the buffer while it is still in use.
-        if let Err(e) = ctx.submit() {
-            return RegisterResult::Pushed { index, error: e };
-        }
-
-        RegisterResult::Submitted(index)
     }
 
     pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let ops = &mut ctx.ops;
-        let Some(lifecycle) = ops.get_mut(index) else {
-            // The corresponding index doesn't exist anymore, so this Op is already complete.
-            return;
+        let cancel_data = data.expect("Data should be present").cancel();
+        let mut ctx = self.uring.context.lock();
+        let Some(Operation::Builtin(lifecycle)) = ctx.ops.get_mut(index) else {
+            panic!("Lifecycle must be present");
         };
 
         // This Op will be cancelled. Here, we don't remove the lifecycle from the slab to keep
         // uring data alive until the operation completes.
 
-        let cancel_data = data.expect("Data should be present").cancel();
         match mem::replace(lifecycle, Lifecycle::Cancelled(cancel_data)) {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => (),
+            previous @ (Lifecycle::Submitted | Lifecycle::Waiting(_)) => {
+                drop(ctx);
+                drop(previous);
+            }
             // The driver saw the completion, but it was never polled.
             Lifecycle::Completed(cqe) => {
-                if let Lifecycle::Cancelled(CancelData::Open(_)) = lifecycle {
-                    if let Ok(fd) = CqeResult::from(cqe).result {
-                        // SAFETY: the successful CQE result provides
-                        // a non-negative integer, and the event is
-                        // related to an open operation.
-                        unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                    }
-                }
-                // We can safely remove the entry from the slab, as it has already been completed.
-                ops.remove(index);
+                let Operation::Builtin(Lifecycle::Cancelled(data)) = ctx.ops.remove(index) else {
+                    unreachable!()
+                };
+                drop(ctx);
+                release_cancelled(data, cqe);
             }
-            prev => panic!("Unexpected state: {prev:?}"),
-        };
+            prev => {
+                drop(ctx);
+                panic!("Unexpected state: {prev:?}");
+            }
+        }
     }
 }
 

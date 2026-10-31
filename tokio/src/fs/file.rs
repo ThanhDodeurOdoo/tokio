@@ -438,6 +438,13 @@ impl File {
         }
     }
 
+    cfg_io_uring! {
+        #[cfg(any(target_env = "gnu", target_os = "android"))]
+        pub(crate) fn uring_fd(&self) -> crate::io::uring::utils::ArcFd {
+            self.std.clone()
+        }
+    }
+
     /// Queries metadata about the underlying file.
     ///
     /// # Examples
