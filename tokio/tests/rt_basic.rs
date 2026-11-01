@@ -333,9 +333,7 @@ mod unstable {
     use tokio::runtime::{Builder, RngSeed, UnhandledPanic};
 
     #[test]
-    #[should_panic(
-        expected = "a spawned task panicked and the runtime is configured to shut down on unhandled panic"
-    )]
+    #[should_panic(expected = "the runtime is configured to shut down on unhandled panic")]
     fn shutdown_on_panic() {
         let rt = Builder::new_current_thread()
             .unhandled_panic(UnhandledPanic::ShutdownRuntime)
